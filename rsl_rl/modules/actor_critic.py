@@ -49,7 +49,7 @@ class ActorCritic(nn.Module):
             num_critic_obs += obs[obs_group].shape[-1]
 
         self.state_dependent_std = state_dependent_std
-        # actor
+        # actor 构建actor网络
         if self.state_dependent_std:
             self.actor = MLP(num_actor_obs, [2, num_actions], actor_hidden_dims, activation)
         else:
@@ -62,7 +62,7 @@ class ActorCritic(nn.Module):
             self.actor_obs_normalizer = torch.nn.Identity()
         print(f"Actor MLP: {self.actor}")
 
-        # critic
+        # critic  构建critic网络
         self.critic = MLP(num_critic_obs, 1, critic_hidden_dims, activation)
         # critic observation normalization
         self.critic_obs_normalization = critic_obs_normalization
@@ -115,7 +115,7 @@ class ActorCritic(nn.Module):
     def entropy(self):
         return self.distribution.entropy().sum(dim=-1)
 
-    def update_distribution(self, obs):
+    def update_distribution(self, obs): # 更新动作分布
         if self.state_dependent_std:
             # compute mean and standard deviation
             mean_and_std = self.actor(obs)
@@ -139,13 +139,13 @@ class ActorCritic(nn.Module):
         # create distribution
         self.distribution = Normal(mean, std)
 
-    def act(self, obs, **kwargs):
+    def act(self, obs, **kwargs): # 根据观测选择动作
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
         self.update_distribution(obs)
         return self.distribution.sample()
 
-    def act_inference(self, obs):
+    def act_inference(self, obs): # 推理时根据观测选择动作
         obs = self.get_actor_obs(obs)
         obs = self.actor_obs_normalizer(obs)
         if self.state_dependent_std:
@@ -153,7 +153,7 @@ class ActorCritic(nn.Module):
         else:
             return self.actor(obs)
 
-    def evaluate(self, obs, **kwargs):
+    def evaluate(self, obs, **kwargs):  # 评估状态值函数
         obs = self.get_critic_obs(obs)
         obs = self.critic_obs_normalizer(obs)
         return self.critic(obs)

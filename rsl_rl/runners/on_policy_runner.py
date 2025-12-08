@@ -18,6 +18,13 @@ from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.utils import resolve_obs_groups, store_code_state
 
+from rsl_rl.motion.motion_dataset import MotionDataset
+
+# from rsl_rl.utils.utils import Normalizer
+from rsl_rl.networks import EmpiricalNormalization as Normalizer
+from rsl_rl.algorithms.amp import AMP, ReplayBuffer
+# from source.isaaclab.isaaclab.envs import ManagerBasedRLEnv as manager_env
+
 
 class OnPolicyRunner:
     """On-policy runner for training and evaluation of actor-critic methods."""
@@ -26,6 +33,7 @@ class OnPolicyRunner:
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
+        self.amp_data_cfg = train_cfg["amp_data"]
         self.device = device
         self.env = env
 
@@ -41,7 +49,41 @@ class OnPolicyRunner:
         default_sets = ["critic"]
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
             default_sets.append("rnd_state")
+        if "amp_data" in self.alg_cfg and self.alg_cfg["amp_data"] is not None:
+            default_sets.append("discriminator")
         self.cfg["obs_groups"] = resolve_obs_groups(obs, self.cfg["obs_groups"], default_sets)
+
+        self.amp_data = MotionDataset(
+            cfg=self.amp_data_cfg,
+            env=env.unwrapped,
+            device=device
+            )
+        obs_manager = env.unwrapped.observation_manager
+        amp_obs_dim = obs_manager.group_obs_dim["discriminator"][0]
+        # print("=" * 50)
+        # print("🔍 [DEBUG] 正在尝试从环境获取一帧真实数据...")
+        # print(f"DEBUG CHECK: AMP observation dimension: {amp_obs_dim}")
+        # print("=" * 50)
+        self.amp_normalizer = Normalizer(amp_obs_dim).to(self.device)
+        self.discriminator = AMP(
+            input_dim = amp_obs_dim * 2,
+            amp_reward_coef = train_cfg['amp_reward_coef'],
+            task_reward_lerp = train_cfg['amp_task_reward_lerp'],
+            amp_hidden_dims = train_cfg['amp_discr_hidden_dims'], 
+            device = device).to(self.device)
+        
+        # self.discriminator.to(self.device)
+        disc_params = [
+            {'params': self.discriminator.trunk.parameters(),
+             'weight_decay': 10e-4, 'name': 'amp_trunk'},
+            {'params': self.discriminator.amp_linear.parameters(),
+             'weight_decay': 10e-2, 'name': 'amp_head'}]
+        disc_lr = self.amp_data_cfg["discriminator_lr"]
+        self.amp_learning_epochs = self.amp_data_cfg["num_learning_epochs"]
+        self.amp_num_mini_batches = self.amp_data_cfg["num_mini_batches"]
+        self.disc_optimizer = torch.optim.Adam(disc_params, lr=disc_lr)
+
+        self.disc_storage = ReplayBuffer(amp_obs_dim, buffer_size=100000, device=self.device)
 
         # create the algorithm
         self.alg = self._construct_algorithm(obs)
@@ -70,19 +112,24 @@ class OnPolicyRunner:
 
         # start learning
         obs = self.env.get_observations().to(self.device)
+        amp_obs = self.discriminator.get_disc_obs(obs)
         self.train_mode()  # switch to train mode (for dropout for example)
 
         # Book keeping
         ep_infos = []
         rewbuffer = deque(maxlen=100)
         lenbuffer = deque(maxlen=100)
+        amp_rewbuffer = deque(maxlen=100)
+        amp_step_rewbuffer = deque(maxlen=self.num_steps_per_env * 100)
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        cur_amp_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
         # create buffers for logging extrinsic and intrinsic rewards
         if self.alg.rnd:
             erewbuffer = deque(maxlen=100)
             irewbuffer = deque(maxlen=100)
+            amp_rewbuffer = deque(maxlen=100)
             cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
             cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
@@ -94,17 +141,63 @@ class OnPolicyRunner:
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
+        amp_loss_dict = {}
         for it in range(start_iter, tot_iter):
             start = time.time()
+
+            # if hasattr(self.discriminator, "update_amp_noise_level"):
+            #     self.discriminator.update_amp_noise_level(it, num_learning_iterations)
+
+            if it < 9000:
+                update_disc_freq = 1
+            else:
+                update_disc_freq = 1
+            
+            should_update_disc = (it % update_disc_freq == 0)
+
             # Rollout
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
                     actions = self.alg.act(obs)
                     # Step the environment
-                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    next_obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     # Move to device
-                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    next_obs, rewards, dones = (next_obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    if "time_outs" in extras:
+                        time_outs = extras["time_outs"].to(self.device)
+
+                        reset_terminated = dones.clone() # 保存原始的 terminated 用于 PPO (如果你的 PPO 区分的话)
+                        reset_time_outs = time_outs
+                        dones = reset_terminated | reset_time_outs
+                    else:
+                        print("Warning: time_outs not found in extras, make sure your wrapper provides it.")
+                    
+                    last_amp_obs = torch.clone(amp_obs)
+                    amp_obs = self.discriminator.get_disc_obs(next_obs)
+
+                    amp_obs_with_term = torch.clone(amp_obs)
+                    reset_env_ids = dones.nonzero(as_tuple=False).squeeze(-1)
+                    if len(reset_env_ids) > 0:
+                        if "terminal_observation" in extras:
+                          term_obs = extras["terminal_observation"]
+                          term_amp_obs = self.discriminator.get_disc_obs(term_obs)
+                          amp_obs_with_term[reset_env_ids] = term_amp_obs
+                        else:
+                          print("Warning: terminal_observation not found in extras!")
+                          pass
+                    #add amp reward
+                    dt = self.env.unwrapped.step_dt
+                    total_rewards, style_rewards = self.discriminator.predict_amp_reward(
+                        last_amp_obs, amp_obs_with_term, rewards, normalizer=self.amp_normalizer, dt=1)
+                    
+                    rewards = total_rewards 
+                    # amp_obs = torch.clone(next_amp_obs) 
+                    # Store transition
+                    self.disc_storage.insert(last_amp_obs, amp_obs_with_term)
+                    #更新obs变量
+                    obs = next_obs
+
                     # process the step
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     # Extract intrinsic rewards (only for logging)
@@ -122,14 +215,20 @@ class OnPolicyRunner:
                             cur_reward_sum += rewards + intrinsic_rewards
                         else:
                             cur_reward_sum += rewards
+                        # update amp rewards
+                        cur_amp_reward_sum += style_rewards
+                        # style_rewards 是 (num_envs,) 的 tensor，取 mean 代表这一刻所有环境的平均表现
+                        amp_step_rewbuffer.append(style_rewards.mean().item())
                         # Update episode length
                         cur_episode_length += 1
                         # Clear data for completed episodes
                         # -- common
-                        new_ids = (dones > 0).nonzero(as_tuple=False)
+                        new_ids = (dones > 0).nonzero(as_tuple=False) #找出结束的环境id
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                        amp_rewbuffer.extend(cur_amp_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
+                        cur_amp_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
                         # -- intrinsic and extrinsic rewards
                         if self.alg.rnd:
@@ -148,9 +247,35 @@ class OnPolicyRunner:
             # update policy
             loss_dict = self.alg.update()
 
+            # AMP discriminator update
+            amp_policy_generator = self.disc_storage.feed_forward_generator(
+                self.amp_learning_epochs * self.amp_num_mini_batches,
+                self.env.num_envs * self.num_steps_per_env // 
+                    self.amp_num_mini_batches)
+            amp_expert_generator = self.amp_data.feed_forward_generator(
+                self.amp_learning_epochs * self.amp_num_mini_batches,
+                self.env.num_envs * self.num_steps_per_env // 
+                    self.amp_num_mini_batches)
+            num_updates = self.amp_learning_epochs * self.amp_num_mini_batches
+            if should_update_disc:
+                amp_loss_dict = self.discriminator.update(
+                    amp_policy_generator, amp_expert_generator, self.disc_optimizer, self.amp_normalizer, num_updates)
+            else:
+                amp_loss_dict = amp_loss_dict
+            # loss_dict.update(amp_loss_dict)
+
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
+            if len(amp_rewbuffer) > 0:
+                mean_amp_reward = statistics.mean(amp_rewbuffer)
+            else:
+                mean_amp_reward = 0.0
+            if len(amp_step_rewbuffer) > 0:
+                mean_amp_step_reward = statistics.mean(amp_step_rewbuffer)
+            else:
+                mean_amp_step_reward = 0.0
+            # loss_dict['mean_amp_reward'] = mean_amp_reward
             # log info
             if self.log_dir is not None and not self.disable_logs:
                 # Log information
@@ -213,6 +338,16 @@ class OnPolicyRunner:
             self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
 
+        # -- AMP Losses & Info Logging --
+        if "amp_loss_dict" in locs:
+            for key, value in locs["amp_loss_dict"].items():
+                self.writer.add_scalar(f"AMP/{key}", value, locs["it"])
+
+        if "mean_amp_reward" in locs:
+            self.writer.add_scalar("AMP/mean_reward", locs["mean_amp_reward"], locs["it"])
+        if "mean_amp_step_reward" in locs:
+            self.writer.add_scalar("AMP/mean_step_reward", locs["mean_amp_step_reward"], locs["it"])
+
         # -- Policy
         self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
 
@@ -250,6 +385,16 @@ class OnPolicyRunner:
             # -- Losses
             for key, value in locs["loss_dict"].items():
                 log_string += f"""{f'Mean {key} loss:':>{pad}} {value:.4f}\n"""
+            
+            # -- AMP Console Output --
+            if "amp_loss_dict" in locs:
+                for key, value in locs["amp_loss_dict"].items():
+                    log_string += f"""{f'AMP {key}:':>{pad}} {value:.4f}\n"""
+            if "mean_amp_reward" in locs:
+                log_string += f"""{'Mean AMP reward:':>{pad}} {locs['mean_amp_reward']:.4f}\n"""
+            if "mean_amp_step_reward" in locs:
+                log_string += f"""{'Mean AMP step reward:':>{pad}} {locs['mean_amp_step_reward']:.4f}\n"""
+
             # -- Rewards
             if hasattr(self.alg, "rnd") and self.alg.rnd:
                 log_string += (
@@ -269,6 +414,11 @@ class OnPolicyRunner:
             )
             for key, value in locs["loss_dict"].items():
                 log_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
+
+            # 空 reward buffer 时的 AMP 显示
+            if "amp_loss_dict" in locs:
+                for key, value in locs["amp_loss_dict"].items():
+                    log_string += f"""{f'AMP {key}:':>{pad}} {value:.4f}\n"""
 
         log_string += ep_string
         log_string += (
@@ -332,6 +482,7 @@ class OnPolicyRunner:
     def train_mode(self):
         # -- PPO
         self.alg.policy.train()
+        self.discriminator.train()
         # -- RND
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.train()

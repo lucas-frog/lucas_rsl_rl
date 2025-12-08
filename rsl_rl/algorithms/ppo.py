@@ -176,6 +176,7 @@ class PPO:
         )
 
     def update(self):  # noqa: C901
+        # (1) 初始化各项 loss 统计变量
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
@@ -191,6 +192,7 @@ class PPO:
             mean_symmetry_loss = None
 
         # generator for mini batches
+        # (2) 从 RolloutBuffer / Storage 里按 mini-batch 抽数据
         if self.policy.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
@@ -218,11 +220,14 @@ class PPO:
             original_batch_size = obs_batch.batch_size[0]
 
             # check if we should normalize advantages per mini batch
+            # (3) 优势归一化（normalize advantages）
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
                     advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
 
             # Perform symmetric augmentation
+            # (4) 数据增强（symmetry augmentation）
+            # 比如对称性任务（机器人左腿↔右腿）
             if self.symmetry and self.symmetry["use_data_augmentation"]:
                 # augmentation using symmetry
                 data_augmentation_func = self.symmetry["data_augmentation_func"]
@@ -246,6 +251,7 @@ class PPO:
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
             # -- actor
+            # (5) 重新计算新策略下的 log_prob、value、entropy
             self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             # -- critic
@@ -257,6 +263,7 @@ class PPO:
             entropy_batch = self.policy.entropy[:original_batch_size]
 
             # KL
+            # (6) 计算 KL 差异并自适应调整学习率
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
                     kl = torch.sum(
@@ -294,6 +301,7 @@ class PPO:
                         param_group["lr"] = self.learning_rate
 
             # Surrogate loss
+            # (7) 计算 PPO 目标（两种截断）
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
             surrogate = -torch.squeeze(advantages_batch) * ratio
             surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
@@ -302,6 +310,7 @@ class PPO:
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
             # Value function loss
+            # (8) 价值函数剪切
             if self.use_clipped_value_loss:
                 value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
                     -self.clip_param, self.clip_param
@@ -312,6 +321,7 @@ class PPO:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
+            # (9) 总损失
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
             # Symmetry loss
