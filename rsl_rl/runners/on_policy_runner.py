@@ -60,10 +60,6 @@ class OnPolicyRunner:
             )
         obs_manager = env.unwrapped.observation_manager
         amp_obs_dim = obs_manager.group_obs_dim["discriminator"][0]
-        # print("=" * 50)
-        # print("🔍 [DEBUG] 正在尝试从环境获取一帧真实数据...")
-        # print(f"DEBUG CHECK: AMP observation dimension: {amp_obs_dim}")
-        # print("=" * 50)
         self.amp_normalizer = Normalizer(amp_obs_dim).to(self.device)
         self.discriminator = AMP(
             input_dim = amp_obs_dim * 2,
@@ -189,7 +185,7 @@ class OnPolicyRunner:
                     #add amp reward
                     dt = self.env.unwrapped.step_dt
                     total_rewards, style_rewards = self.discriminator.predict_amp_reward(
-                        last_amp_obs, amp_obs_with_term, rewards, normalizer=self.amp_normalizer, dt=1)
+                        last_amp_obs, amp_obs_with_term, rewards, normalizer=self.amp_normalizer, dt=dt)
                     
                     rewards = total_rewards 
                     # amp_obs = torch.clone(next_amp_obs) 

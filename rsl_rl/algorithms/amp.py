@@ -124,7 +124,6 @@ class AMP(nn.Module):
     
     def _lerp_reward(self, disc_r, task_r):
         r = (1.0 - self.task_reward_lerp) * disc_r + self.task_reward_lerp * task_r
-        # r = 4 * disc_r + task_r
         return r
     
     def update(self, policy_generator, expert_generator, optimizer, normalizer=None, num_updates=1):

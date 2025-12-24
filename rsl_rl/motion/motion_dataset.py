@@ -9,6 +9,13 @@ from types import SimpleNamespace
 
 from isaaclab.utils import configclass
 from dataclasses import MISSING
+from isaaclab.utils.math import ( 
+    quat_apply_inverse,
+    quat_conjugate,
+    quat_mul,
+    quat_apply,
+)
+from functools import cached_property
 # from .motion_transition import MotionTransition
 
 class MotionDataset:
@@ -38,10 +45,10 @@ class MotionDataset:
             self.robot.find_bodies(body_names, preserve_order=True)[0], dtype=torch.long, device=device
         )
 
-        # anchor_name = cfg.anchor_name
-        # self.anchor_index = torch.tensor(
-        #     self.robot.find_bodies(anchor_name, preserve_order=True)[0], dtype=torch.long, device=device
-        # )
+        anchor_name = cfg.anchor_name
+        self.anchor_index = torch.tensor(
+            self.robot.find_bodies(anchor_name, preserve_order=True)[0], dtype=torch.long, device=device
+        )
         
         self.load_motions()
         self.init_observation_dims()
@@ -201,7 +208,7 @@ class MotionDatasetCfg:
     motion_files:  List[str] = MISSING
     body_names:    List[str] = MISSING
     amp_obs_terms: List[str] = MISSING
-    # anchor_name:   str = MISSING
+    anchor_name:   str = MISSING
     discriminator_lr: float = MISSING
     num_learning_epochs: int = MISSING
     num_mini_batches: int = MISSING
