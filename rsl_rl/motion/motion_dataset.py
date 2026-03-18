@@ -61,6 +61,7 @@ class MotionDataset:
         body_quat_w_list = []
         body_lin_vel_w_list = []
         body_ang_vel_w_list = []
+        projected_gravity_list = []
         fps_list = []
         traj_lengths = []
 
@@ -79,6 +80,7 @@ class MotionDataset:
             body_quat_w_list.append(torch.tensor(data["body_quat_w"], dtype=torch.float32))
             body_lin_vel_w_list.append(torch.tensor(data["body_lin_vel_w"], dtype=torch.float32))
             body_ang_vel_w_list.append(torch.tensor(data["body_ang_vel_w"], dtype=torch.float32))
+            projected_gravity_list.append(torch.tensor(data["projected_gravity"], dtype=torch.float32))
 
         # Concatenate all trajectories into single big tensors
         self.joint_pos      = torch.cat(joint_pos_list, dim=0).to(self.device)
@@ -87,6 +89,7 @@ class MotionDataset:
         self.body_quat_w_all     = torch.cat(body_quat_w_list, dim=0).to(self.device)
         self.body_lin_vel_w_all  = torch.cat(body_lin_vel_w_list, dim=0).to(self.device)
         self.body_ang_vel_w_all  = torch.cat(body_ang_vel_w_list, dim=0).to(self.device)
+        self.projected_gravity = torch.cat(projected_gravity_list, dim=0).to(self.device)
 
         self.total_dataset_size = sum(traj_lengths)
 
