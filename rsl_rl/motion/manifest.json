@@ -1,0 +1,19 @@
+{
+    "datasets": [
+      {
+        "name": "walk1",
+        "path": "/home/lucas/whole_body_tracking/artifacts/amp_walk1:v0/walk1.npz",
+        "style": "walk"
+      },
+      {
+        "name": "walk5",
+        "path": "/home/lucas/whole_body_tracking/artifacts/amp_walk5:v0/walk5.npz",
+        "style": "walk"
+      },
+      {
+        "name": "run1",
+        "path": "/home/lucas/whole_body_tracking/artifacts/amp_run1:v0/run1.npz",
+        "style": "walk"
+      }
+    ]
+  }
