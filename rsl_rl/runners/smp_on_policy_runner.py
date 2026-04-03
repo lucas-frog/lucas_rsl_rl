@@ -66,6 +66,254 @@ class SMPOnPolicyRunner(OnPolicyRunner):
         self.gsi_sampler = self._build_gsi_sampler()
         self.git_status_repos.append(rsl_rl.__file__)
 
+    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
+        """执行 on-policy 训练主循环，在 rollout 中引入 SMP 指标与 GSI reset 机制。"""
+        self._prepare_logging_writer()
+
+        # randomize initial episode lengths (for exploration)
+        if init_at_random_ep_len:
+            self.env.episode_length_buf = torch.randint_like(
+                self.env.episode_length_buf, high=int(self.env.max_episode_length)
+            )
+
+        # start learning
+        obs = self.env.get_observations().to(self.device)
+        self.train_mode()
+
+        # Book keeping
+        ep_infos = []
+        rewbuffer = deque(maxlen=100)
+        lenbuffer = deque(maxlen=100)
+        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+
+        # create buffers for logging extrinsic and intrinsic rewards
+        if self.alg.rnd:
+            erewbuffer = deque(maxlen=100)
+            irewbuffer = deque(maxlen=100)
+            cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+            cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+
+        # Ensure all parameters are in-synced
+        if self.is_distributed:
+            print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
+            self.alg.broadcast_parameters()
+
+        # Start training
+        start_iter = self.current_learning_iteration
+        tot_iter = start_iter + num_learning_iterations
+        for it in range(start_iter, tot_iter):
+            start = time.time()
+            # 每轮迭代都统计 SMP 相关的均值，用来观察 prior 质量和 reset 重采样行为是否稳定。
+            iter_smp_rewards = []
+            iter_smp_noise = []
+            iter_smp_cfg_gap = []
+            iter_gsi_accept_rates = []
+            iter_gsi_resample_counts = []
+            iter_gsi_fallback_rates = []
+            iter_smp_timestep_noise = {timestep: [] for timestep in self.smp_reward.timesteps_k}
+            last_smp_eps = None
+            last_smp_eps_hat = None
+            last_style_diag = {}
+
+            # Rollout
+            with torch.inference_mode():
+                for _ in range(self.num_steps_per_env):
+                    # reward 使用 terminal-corrected 观测，policy 则继续消费 reset / GSI 后的观测。
+                    actions = self.alg.act(obs)
+                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    reward_obs = self._build_smp_reward_obs(obs, dones, extras)
+                    obs, gsi_diag = self._maybe_apply_gsi_reset(obs, dones)
+
+                    smp_metrics = self._compute_smp_metrics(reward_obs)
+                    rewards = self._combine_rewards(rewards, smp_metrics["reward"])
+                    # process the step
+                    self.alg.process_env_step(obs, rewards, dones, extras)
+
+                    last_smp_eps = smp_metrics["eps"]
+                    last_smp_eps_hat = smp_metrics["eps_hat"]
+                    last_style_diag = smp_metrics["style_diag"]
+                    iter_smp_rewards.append(float(smp_metrics["reward"].mean().item()))
+                    iter_smp_noise.append(float(smp_metrics["noise_mse"].mean().item()))
+                    iter_smp_cfg_gap.append(float(smp_metrics["cond_uncond_gap"]))
+                    iter_gsi_accept_rates.append(float(gsi_diag["reset_accept_rate"]))
+                    iter_gsi_resample_counts.append(float(gsi_diag["reset_resample_count"]))
+                    iter_gsi_fallback_rates.append(float(gsi_diag["fallback_rate"]))
+                    for timestep, mse in smp_metrics["per_timestep_mse"].items():
+                        iter_smp_timestep_noise[int(timestep)].append(float(mse.mean().item()))
+                    
+                    # Extract intrinsic rewards (only for logging)
+                    intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
+                    # book keeping
+                    if self.log_dir is not None:
+                        # 把 episode 级别信息累积到 buffer，供 logger 汇总平均 return / length。
+                        if "episode" in extras:
+                            ep_infos.append(extras["episode"])
+                        elif "log" in extras:
+                            ep_infos.append(extras["log"])
+                        # Update rewards
+                        if self.alg.rnd:
+                            cur_ereward_sum += rewards
+                            cur_ireward_sum += intrinsic_rewards  # type: ignore[arg-type]
+                            cur_reward_sum += rewards + intrinsic_rewards
+                        else:
+                            cur_reward_sum += rewards
+                        # Update episode length
+                        cur_episode_length += 1
+                        # Clear data for completed episodes
+                        # -- common
+                        new_ids = (dones > 0).nonzero(as_tuple=False)
+                        rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                        lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+                        cur_reward_sum[new_ids] = 0
+                        cur_episode_length[new_ids] = 0
+                        # -- intrinsic and extrinsic rewards
+                        if self.alg.rnd:
+                            erewbuffer.extend(cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            cur_ereward_sum[new_ids] = 0
+                            cur_ireward_sum[new_ids] = 0
+
+                stop = time.time()
+                collection_time = stop - start
+                start = stop
+                
+                # compute returns
+                self.alg.compute_returns(obs)
+
+            # update policy
+            loss_dict = self.alg.update()
+
+            stop = time.time()
+            learn_time = stop - start
+            self.current_learning_iteration = it
+            # log info
+            if self.log_dir is not None and not self.disable_logs:
+                smp_per_timestep_mse = {
+                    timestep: statistics.mean(values)
+                    for timestep, values in iter_smp_timestep_noise.items()
+                    if len(values) > 0
+                }
+                # Log information
+                self.log(
+                    {
+                        **locals(),
+                        "smp_mean_reward": statistics.mean(iter_smp_rewards) if len(iter_smp_rewards) > 0 else 0.0,
+                        "smp_noise_mse": statistics.mean(iter_smp_noise) if len(iter_smp_noise) > 0 else 0.0,
+                        "smp_cfg_gap": statistics.mean(iter_smp_cfg_gap) if len(iter_smp_cfg_gap) > 0 else 0.0,
+                        "gsi_reset_accept_rate": statistics.mean(iter_gsi_accept_rates) if len(iter_gsi_accept_rates) > 0 else 0.0,
+                        "gsi_reset_resample_count": statistics.mean(iter_gsi_resample_counts) if len(iter_gsi_resample_counts) > 0 else 0.0,
+                        "gsi_fallback_rate": statistics.mean(iter_gsi_fallback_rates) if len(iter_gsi_fallback_rates) > 0 else 0.0,
+                        "smp_per_timestep_mse": smp_per_timestep_mse,
+                        "smp_eps": last_smp_eps,
+                        "smp_eps_hat": last_smp_eps_hat,
+                        "style_program": self.style_program,
+                        "style_diag": last_style_diag,
+                    }
+                )
+                # Save model
+                if it % self.save_interval == 0:
+                    self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+
+            # Clear episode infos
+            ep_infos.clear()
+            # Save code state
+            if it == start_iter and not self.disable_logs:
+                # obtain all the diff files
+                git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
+                # if possible store them to wandb
+                if self.logger_type in ["wandb", "neptune"] and git_file_paths:
+                    for file_path in git_file_paths:
+                        self.writer.save_file(file_path)
+
+        # Save the final model after training
+        if self.log_dir is not None and not self.disable_logs:
+            self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+
+    def log(self, locs: dict, width: int = 80, pad: int = 35):
+        """记录 PPO 与 SMP 相关日志，包括风格程序、噪声指标和 GSI 统计。"""
+        super().log(locs, width=width, pad=pad)
+        if "smp_mean_reward" not in locs:
+            return
+
+        # 这一组标量记录的是“训练过程的宏观健康度”：reward、噪声误差、CFG gap 和 GSI 重采样质量。
+        # SMP 先验模块计算所得的模仿动作均值奖励
+        self.writer.add_scalar("SMP/reward", locs["smp_mean_reward"], locs["it"])
+        # 扩散先验在各个采样时间步上预测噪声的总 MSE 误差均值
+        self.writer.add_scalar("SMP/cfg/noise_mse", float(locs["smp_noise_mse"]), locs["it"])
+        # CFG 引导机制下，有条件预测与无条件预测的差异量（体现了注入条件对动作的影响强度）
+        self.writer.add_scalar("SMP/cfg/cond_uncond_gap", float(locs["smp_cfg_gap"]), locs["it"])
+        # GSI重置阶段：生成的初始状态满足物理等约束要求、被直接接受的通过率
+        self.writer.add_scalar("SMP/GSI/reset_accept_rate", float(locs.get("gsi_reset_accept_rate", 0.0)), locs["it"])
+        # GSI重置阶段：为了找到有效状态平均需要的重新采样尝试次数
+        self.writer.add_scalar("SMP/GSI/reset_resample_count", float(locs.get("gsi_reset_resample_count", 0.0)), locs["it"])
+        # GSI重置阶段：受限于持续失败从而最终回退至预设静态默认姿态的比例
+        self.writer.add_scalar("SMP/GSI/fallback_rate", float(locs.get("gsi_fallback_rate", 0.0)), locs["it"])
+
+        mode = locs["style_program"]["mode"]
+        mode_to_scalar = {"unconditional": -1.0, "single_style": 0.0, "body_mask": 1.0}
+        # 当前日志记录周期使用的风格模式分类：无条件(-1.0)、全局单风格(0.0)、局部掩码组合(1.0)
+        self.writer.add_scalar("SMP/style/mode", mode_to_scalar.get(mode, -2.0), locs["it"])
+        if mode == "single_style":
+            # 在单一风格模式下，配置中指定要求跟随的具体目标风格 ID
+            self.writer.add_scalar("SMP/style/target_id", float(locs["style_program"]["target_style_id"]), locs["it"])
+        elif mode == "body_mask":
+            # 局部掩码模式下：分配给全身共享重叠区域部位的动作风格 ID
+            self.writer.add_scalar(
+                "SMP/style_program/shared_body_style_id",
+                float(locs["style_program"]["part_style_ids"]["shared_body"]),
+                locs["it"],
+            )
+            # 局部掩码模式下：分配给上半身对应的独立动作风格 ID
+            self.writer.add_scalar(
+                "SMP/style_program/upper_body_style_id",
+                float(locs["style_program"]["part_style_ids"]["upper_body"]),
+                locs["it"],
+            )
+            # 局部掩码模式下：分配给下半身对应的独立动作风格 ID
+            self.writer.add_scalar(
+                "SMP/style_program/lower_body_style_id",
+                float(locs["style_program"]["part_style_ids"]["lower_body"]),
+                locs["it"],
+            )
+            # 若缺失共享区域指定，标识其是否自动降级借用了其他部位(如下半身)的风格配置
+            self.writer.add_scalar(
+                "SMP/style_program/shared_body_defaulted",
+                float(locs["style_program"].get("shared_body_defaulted", False)),
+                locs["it"],
+            )
+            # 上下半身掩码叠加后，对整个机器人的关节动作特征维度占据的覆盖率
+            self.writer.add_scalar("SMP/style_mask/coverage", float(locs["style_program"]["coverage"]), locs["it"])
+
+        if locs["it"] % self.log_histograms_every == 0:
+            log_smp_noise_metrics(
+                self.writer,
+                global_step=locs["it"],
+                noise_mse=locs["smp_noise_mse"],
+                per_timestep_mse=locs["smp_per_timestep_mse"],
+                eps=locs["smp_eps"],
+                eps_hat=locs["smp_eps_hat"],
+                prefix="SMP",
+            )
+            return
+
+        # 每轮迭代都常规上报噪声计算的总验证 MSE，维持监控曲线稳定
+        self.writer.add_scalar("SMP/noise_mse", float(locs["smp_noise_mse"]), locs["it"])
+        for timestep, mse in sorted(locs["smp_per_timestep_mse"].items()):
+            # 将误差细分到每个特定的扩散采样时间步(timestep)，用于诊断模型对早晚期噪声的还原状况
+            self.writer.add_scalar(f"SMP/t{timestep}/noise_mse", float(mse), locs["it"])
+
+    def train_mode(self):
+        """切换到训练模式，并保持 prior 始终处于 eval 状态。"""
+        super().train_mode()
+        self.smp_prior.eval()
+
+    def eval_mode(self):
+        """切换到评估模式，并保持 prior 始终处于 eval 状态。"""
+        super().eval_mode()
+        self.smp_prior.eval()
+
     def _load_prior_model(self) -> MotionEpsilonTransformer:
         """从 checkpoint 加载并冻结 diffusion prior，返回推理模式模型。"""
         checkpoint_path = self.smp_prior_cfg["checkpoint_path"]
@@ -213,6 +461,108 @@ class SMPOnPolicyRunner(OnPolicyRunner):
             return {key: value.to(self.device) if hasattr(value, "to") else value for key, value in obs.items()}
         return obs
 
+    def _done_env_ids(self, dones: torch.Tensor) -> torch.Tensor:
+        """将 done 张量归一化为一维环境索引。"""
+        done_mask = dones > 0
+        if done_mask.ndim > 1:
+            done_mask = done_mask.view(done_mask.shape[0], -1).any(dim=1)
+        return done_mask.nonzero(as_tuple=False).squeeze(-1)
+
+    def _wrap_obs_like(self, obs_dict, obs_like):
+        """尽量按输入观测的容器类型返回刷新后的观测。"""
+        batch_size = getattr(obs_like, "batch_size", None)
+        if batch_size is None:
+            return obs_dict
+        kwargs = {"batch_size": batch_size}
+        device = getattr(obs_like, "device", None)
+        if device is not None:
+            kwargs["device"] = device
+        try:
+            return type(obs_like)(obs_dict, **kwargs)
+        except Exception:
+            return obs_dict
+
+    def _compute_obs_term_value(self, env, term_cfg) -> torch.Tensor:
+        """复用 ObservationManager 的单项观测后处理逻辑。"""
+        obs = term_cfg.func(env, **term_cfg.params).clone()
+        if term_cfg.modifiers is not None:
+            for modifier in term_cfg.modifiers:
+                obs = modifier.func(obs, **modifier.params)
+        noise_cfg = term_cfg.noise
+        noise_func = getattr(noise_cfg, "func", None)
+        if noise_func is not None:
+            try:
+                obs = noise_func(obs, noise_cfg)
+            except TypeError:
+                obs = noise_func(obs)
+        if term_cfg.clip:
+            obs = obs.clip_(min=term_cfg.clip[0], max=term_cfg.clip[1])
+        if term_cfg.scale is not None:
+            obs = obs.mul_(term_cfg.scale)
+        return obs
+
+    def _refresh_reset_env_observations(self, obs_like, reset_env_ids: torch.Tensor):
+        """在 GSI 改写 reset state 后，仅重建受影响环境的历史观测。"""
+        target_env = getattr(self.env, "unwrapped", self.env)
+        obs_manager = getattr(target_env, "observation_manager", None)
+        if obs_manager is None or reset_env_ids.numel() == 0:
+            return self._move_obs_to_device(self.env.get_observations())
+
+        refreshed_obs = {}
+        for group_name, group_term_names in obs_manager._group_obs_term_names.items():
+            group_obs = dict.fromkeys(group_term_names, None)
+            for term_name, term_cfg in zip(group_term_names, obs_manager._group_obs_term_cfgs[group_name]):
+                term_obs = self._compute_obs_term_value(obs_manager._env, term_cfg)
+                if term_cfg.history_length > 0:
+                    circular_buffer = obs_manager._group_obs_term_history_buffer[group_name][term_name]
+                    if circular_buffer._buffer is None:
+                        repeat_dims = [1] * term_obs.ndim
+                        circular_buffer._buffer = term_obs.unsqueeze(0).repeat(circular_buffer.max_length, *repeat_dims)
+                        circular_buffer._pointer = circular_buffer.max_length - 1
+                        circular_buffer._num_pushes[:] = 1
+                    repeated_obs = term_obs[reset_env_ids].unsqueeze(0).expand(
+                        circular_buffer.max_length, *term_obs[reset_env_ids].shape
+                    )
+                    circular_buffer._buffer[:, reset_env_ids] = repeated_obs
+                    circular_buffer._num_pushes[reset_env_ids] = 1
+                    if term_cfg.flatten_history_dim:
+                        group_obs[term_name] = circular_buffer.buffer.reshape(target_env.num_envs, -1)
+                    else:
+                        group_obs[term_name] = circular_buffer.buffer
+                else:
+                    group_obs[term_name] = term_obs
+
+            if obs_manager._group_obs_concatenate[group_name]:
+                refreshed_obs[group_name] = torch.cat(
+                    list(group_obs.values()), dim=obs_manager._group_obs_concatenate_dim[group_name]
+                )
+            else:
+                refreshed_obs[group_name] = group_obs
+
+        return self._move_obs_to_device(self._wrap_obs_like(refreshed_obs, obs_like))
+
+    def _build_smp_reward_obs(self, obs, dones, extras):
+        """为 SMP reward 构造终止态修正后的观测窗口。"""
+        if self.smp_obs_group not in obs:
+            return obs
+
+        reward_window = obs[self.smp_obs_group].clone()
+        reset_env_ids = self._done_env_ids(dones)
+        if reset_env_ids.numel() == 0:
+            return {self.smp_obs_group: reward_window}
+
+        terminal_obs = extras.get("terminal_observation")
+        if terminal_obs is None:
+            return {self.smp_obs_group: reward_window}
+
+        try:
+            terminal_window = terminal_obs[self.smp_obs_group]
+        except Exception:
+            return {self.smp_obs_group: reward_window}
+
+        reward_window[reset_env_ids] = terminal_window.to(reward_window.device)
+        return {self.smp_obs_group: reward_window}
+
     def _maybe_apply_gsi_reset(self, obs, dones):
         """在环境 reset 时按需执行 GSI 重采样，并返回更新后的观测与诊断指标。"""
         default_diag = {"reset_accept_rate": 0.0, "reset_resample_count": 0.0, "fallback_rate": 0.0}
@@ -220,10 +570,7 @@ class SMPOnPolicyRunner(OnPolicyRunner):
             return obs, default_diag
 
         # 只对刚刚结束 episode 的环境执行 reset 重采样，避免无关环境被误改写。
-        done_mask = dones > 0
-        if done_mask.ndim > 1:
-            done_mask = done_mask.view(done_mask.shape[0], -1).any(dim=1)
-        reset_env_ids = done_mask.nonzero(as_tuple=False).squeeze(-1)
+        reset_env_ids = self._done_env_ids(dones)
         if reset_env_ids.numel() == 0:
             return obs, default_diag
 
@@ -252,7 +599,7 @@ class SMPOnPolicyRunner(OnPolicyRunner):
             if last_result.supports_reset_state:
                 # 只有采样结果满足环境 reset 约束时，才真正写回仿真环境。
                 apply_smp_reset_state(self.env, env_ids=reset_env_ids, state=last_result.state, asset_name=asset_name)
-                refreshed_obs = self._move_obs_to_device(self.env.get_observations())
+                refreshed_obs = self._refresh_reset_env_observations(obs, reset_env_ids)
                 return refreshed_obs, {
                     "reset_accept_rate": 1.0,
                     "reset_resample_count": float(attempt),
@@ -261,7 +608,7 @@ class SMPOnPolicyRunner(OnPolicyRunner):
 
         if last_result is not None and not bool(_cfg_get(self.gsi_cfg, "fallback_to_default_reset", True)):
             apply_smp_reset_state(self.env, env_ids=reset_env_ids, state=last_result.state, asset_name=asset_name)
-            refreshed_obs = self._move_obs_to_device(self.env.get_observations())
+            refreshed_obs = self._refresh_reset_env_observations(obs, reset_env_ids)
             return refreshed_obs, {
                 "reset_accept_rate": 0.0,
                 "reset_resample_count": float(max_resample_attempts - 1),
@@ -363,250 +710,3 @@ class SMPOnPolicyRunner(OnPolicyRunner):
             smp_rewards = smp_rewards.unsqueeze(-1)
         dt = self.env.unwrapped.step_dt
         return self.task_reward_coef * task_rewards + self.smp_reward_coef * smp_rewards * dt
-
-    def log(self, locs: dict, width: int = 80, pad: int = 35):
-        """记录 PPO 与 SMP 相关日志，包括风格程序、噪声指标和 GSI 统计。"""
-        super().log(locs, width=width, pad=pad)
-        if "smp_mean_reward" not in locs:
-            return
-
-        # 这一组标量记录的是“训练过程的宏观健康度”：reward、噪声误差、CFG gap 和 GSI 重采样质量。
-        # SMP 先验模块计算所得的模仿动作均值奖励
-        self.writer.add_scalar("SMP/reward", locs["smp_mean_reward"], locs["it"])
-        # 扩散先验在各个采样时间步上预测噪声的总 MSE 误差均值
-        self.writer.add_scalar("SMP/cfg/noise_mse", float(locs["smp_noise_mse"]), locs["it"])
-        # CFG 引导机制下，有条件预测与无条件预测的差异量（体现了注入条件对动作的影响强度）
-        self.writer.add_scalar("SMP/cfg/cond_uncond_gap", float(locs["smp_cfg_gap"]), locs["it"])
-        # GSI重置阶段：生成的初始状态满足物理等约束要求、被直接接受的通过率
-        self.writer.add_scalar("SMP/GSI/reset_accept_rate", float(locs.get("gsi_reset_accept_rate", 0.0)), locs["it"])
-        # GSI重置阶段：为了找到有效状态平均需要的重新采样尝试次数
-        self.writer.add_scalar("SMP/GSI/reset_resample_count", float(locs.get("gsi_reset_resample_count", 0.0)), locs["it"])
-        # GSI重置阶段：受限于持续失败从而最终回退至预设静态默认姿态的比例
-        self.writer.add_scalar("SMP/GSI/fallback_rate", float(locs.get("gsi_fallback_rate", 0.0)), locs["it"])
-
-        mode = locs["style_program"]["mode"]
-        mode_to_scalar = {"unconditional": -1.0, "single_style": 0.0, "body_mask": 1.0}
-        # 当前日志记录周期使用的风格模式分类：无条件(-1.0)、全局单风格(0.0)、局部掩码组合(1.0)
-        self.writer.add_scalar("SMP/style/mode", mode_to_scalar.get(mode, -2.0), locs["it"])
-        if mode == "single_style":
-            # 在单一风格模式下，配置中指定要求跟随的具体目标风格 ID
-            self.writer.add_scalar("SMP/style/target_id", float(locs["style_program"]["target_style_id"]), locs["it"])
-        elif mode == "body_mask":
-            # 局部掩码模式下：分配给全身共享重叠区域部位的动作风格 ID
-            self.writer.add_scalar(
-                "SMP/style_program/shared_body_style_id",
-                float(locs["style_program"]["part_style_ids"]["shared_body"]),
-                locs["it"],
-            )
-            # 局部掩码模式下：分配给上半身对应的独立动作风格 ID
-            self.writer.add_scalar(
-                "SMP/style_program/upper_body_style_id",
-                float(locs["style_program"]["part_style_ids"]["upper_body"]),
-                locs["it"],
-            )
-            # 局部掩码模式下：分配给下半身对应的独立动作风格 ID
-            self.writer.add_scalar(
-                "SMP/style_program/lower_body_style_id",
-                float(locs["style_program"]["part_style_ids"]["lower_body"]),
-                locs["it"],
-            )
-            # 若缺失共享区域指定，标识其是否自动降级借用了其他部位(如下半身)的风格配置
-            self.writer.add_scalar(
-                "SMP/style_program/shared_body_defaulted",
-                float(locs["style_program"].get("shared_body_defaulted", False)),
-                locs["it"],
-            )
-            # 上下半身掩码叠加后，对整个机器人的关节动作特征维度占据的覆盖率
-            self.writer.add_scalar("SMP/style_mask/coverage", float(locs["style_program"]["coverage"]), locs["it"])
-
-        if locs["it"] % self.log_histograms_every == 0:
-            log_smp_noise_metrics(
-                self.writer,
-                global_step=locs["it"],
-                noise_mse=locs["smp_noise_mse"],
-                per_timestep_mse=locs["smp_per_timestep_mse"],
-                eps=locs["smp_eps"],
-                eps_hat=locs["smp_eps_hat"],
-                prefix="SMP",
-            )
-            return
-
-        # 每轮迭代都常规上报噪声计算的总验证 MSE，维持监控曲线稳定
-        self.writer.add_scalar("SMP/noise_mse", float(locs["smp_noise_mse"]), locs["it"])
-        for timestep, mse in sorted(locs["smp_per_timestep_mse"].items()):
-            # 将误差细分到每个特定的扩散采样时间步(timestep)，用于诊断模型对早晚期噪声的还原状况
-            self.writer.add_scalar(f"SMP/t{timestep}/noise_mse", float(mse), locs["it"])
-
-    def train_mode(self):
-        """切换到训练模式，并保持 prior 始终处于 eval 状态。"""
-        super().train_mode()
-        self.smp_prior.eval()
-
-    def eval_mode(self):
-        """切换到评估模式，并保持 prior 始终处于 eval 状态。"""
-        super().eval_mode()
-        self.smp_prior.eval()
-
-    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
-        """执行 on-policy 训练主循环，在 rollout 中引入 SMP 指标与 GSI reset 机制。"""
-        self._prepare_logging_writer()
-
-        # randomize initial episode lengths (for exploration)
-        if init_at_random_ep_len:
-            self.env.episode_length_buf = torch.randint_like(
-                self.env.episode_length_buf, high=int(self.env.max_episode_length)
-            )
-
-        # start learning
-        obs = self.env.get_observations().to(self.device)
-        self.train_mode()
-
-        # Book keeping
-        ep_infos = []
-        rewbuffer = deque(maxlen=100)
-        lenbuffer = deque(maxlen=100)
-        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-        cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-
-        # create buffers for logging extrinsic and intrinsic rewards
-        if self.alg.rnd:
-            erewbuffer = deque(maxlen=100)
-            irewbuffer = deque(maxlen=100)
-            cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-            cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-
-        # Ensure all parameters are in-synced
-        if self.is_distributed:
-            print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
-            self.alg.broadcast_parameters()
-
-        # Start training
-        start_iter = self.current_learning_iteration
-        tot_iter = start_iter + num_learning_iterations
-        for it in range(start_iter, tot_iter):
-            start = time.time()
-            # 每轮迭代都统计 SMP 相关的均值，用来观察 prior 质量和 reset 重采样行为是否稳定。
-            iter_smp_rewards = []
-            iter_smp_noise = []
-            iter_smp_cfg_gap = []
-            iter_gsi_accept_rates = []
-            iter_gsi_resample_counts = []
-            iter_gsi_fallback_rates = []
-            iter_smp_timestep_noise = {timestep: [] for timestep in self.smp_reward.timesteps_k}
-            last_smp_eps = None
-            last_smp_eps_hat = None
-            last_style_diag = {}
-
-            # Rollout
-            with torch.inference_mode():
-                for _ in range(self.num_steps_per_env):
-                    # policy 负责给出动作，环境 step 后先做必要的 reset 修正，再计算 SMP reward。
-                    actions = self.alg.act(obs)
-                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
-                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
-                    obs, gsi_diag = self._maybe_apply_gsi_reset(obs, dones)
-
-                    smp_metrics = self._compute_smp_metrics(obs)
-                    rewards = self._combine_rewards(rewards, smp_metrics["reward"])
-                    # process the step
-                    self.alg.process_env_step(obs, rewards, dones, extras)
-
-                    last_smp_eps = smp_metrics["eps"]
-                    last_smp_eps_hat = smp_metrics["eps_hat"]
-                    last_style_diag = smp_metrics["style_diag"]
-                    iter_smp_rewards.append(float(smp_metrics["reward"].mean().item()))
-                    iter_smp_noise.append(float(smp_metrics["noise_mse"].mean().item()))
-                    iter_smp_cfg_gap.append(float(smp_metrics["cond_uncond_gap"]))
-                    iter_gsi_accept_rates.append(float(gsi_diag["reset_accept_rate"]))
-                    iter_gsi_resample_counts.append(float(gsi_diag["reset_resample_count"]))
-                    iter_gsi_fallback_rates.append(float(gsi_diag["fallback_rate"]))
-                    for timestep, mse in smp_metrics["per_timestep_mse"].items():
-                        iter_smp_timestep_noise[int(timestep)].append(float(mse.mean().item()))
-                    
-                    # Extract intrinsic rewards (only for logging)
-                    intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
-                    # book keeping
-                    if self.log_dir is not None:
-                        # 把 episode 级别信息累积到 buffer，供 logger 汇总平均 return / length。
-                        if "episode" in extras:
-                            ep_infos.append(extras["episode"])
-                        elif "log" in extras:
-                            ep_infos.append(extras["log"])
-                        # Update rewards
-                        if self.alg.rnd:
-                            cur_ereward_sum += rewards
-                            cur_ireward_sum += intrinsic_rewards  # type: ignore[arg-type]
-                            cur_reward_sum += rewards + intrinsic_rewards
-                        else:
-                            cur_reward_sum += rewards
-                        # Update episode length
-                        cur_episode_length += 1
-                        # Clear data for completed episodes
-                        # -- common
-                        new_ids = (dones > 0).nonzero(as_tuple=False)
-                        rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                        lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
-                        cur_reward_sum[new_ids] = 0
-                        cur_episode_length[new_ids] = 0
-                        # -- intrinsic and extrinsic rewards
-                        if self.alg.rnd:
-                            erewbuffer.extend(cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                            irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                            cur_ereward_sum[new_ids] = 0
-                            cur_ireward_sum[new_ids] = 0
-
-                stop = time.time()
-                collection_time = stop - start
-                start = stop
-                
-                # compute returns
-                self.alg.compute_returns(obs)
-
-            # update policy
-            loss_dict = self.alg.update()
-
-            stop = time.time()
-            learn_time = stop - start
-            self.current_learning_iteration = it
-            # log info
-            if self.log_dir is not None and not self.disable_logs:
-                smp_per_timestep_mse = {
-                    timestep: statistics.mean(values)
-                    for timestep, values in iter_smp_timestep_noise.items()
-                    if len(values) > 0
-                }
-                # Log information
-                self.log(
-                    {
-                        **locals(),
-                        "smp_mean_reward": statistics.mean(iter_smp_rewards) if len(iter_smp_rewards) > 0 else 0.0,
-                        "smp_noise_mse": statistics.mean(iter_smp_noise) if len(iter_smp_noise) > 0 else 0.0,
-                        "smp_cfg_gap": statistics.mean(iter_smp_cfg_gap) if len(iter_smp_cfg_gap) > 0 else 0.0,
-                        "gsi_reset_accept_rate": statistics.mean(iter_gsi_accept_rates) if len(iter_gsi_accept_rates) > 0 else 0.0,
-                        "gsi_reset_resample_count": statistics.mean(iter_gsi_resample_counts) if len(iter_gsi_resample_counts) > 0 else 0.0,
-                        "gsi_fallback_rate": statistics.mean(iter_gsi_fallback_rates) if len(iter_gsi_fallback_rates) > 0 else 0.0,
-                        "smp_per_timestep_mse": smp_per_timestep_mse,
-                        "smp_eps": last_smp_eps,
-                        "smp_eps_hat": last_smp_eps_hat,
-                        "style_program": self.style_program,
-                        "style_diag": last_style_diag,
-                    }
-                )
-                # Save model
-                if it % self.save_interval == 0:
-                    self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
-
-            # Clear episode infos
-            ep_infos.clear()
-            # Save code state
-            if it == start_iter and not self.disable_logs:
-                # obtain all the diff files
-                git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
-                # if possible store them to wandb
-                if self.logger_type in ["wandb", "neptune"] and git_file_paths:
-                    for file_path in git_file_paths:
-                        self.writer.save_file(file_path)
-
-        # Save the final model after training
-        if self.log_dir is not None and not self.disable_logs:
-            self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
