@@ -59,10 +59,13 @@ class SMPOnPolicyRunner(OnPolicyRunner):
             num_diffusion_steps=int(self.smp_prior_cfg["num_diffusion_steps"]),
             timesteps_k=list(self.smp_prior_cfg["timesteps_k"]),
             reward_scale=float(self.smp_prior_cfg["reward_scale"]),
+            reward_mode=str(_cfg_get(self.smp_prior_cfg, "reward_mode", "absolute")),
             adaptive_norm_decay=float(self.smp_prior_cfg.get("adaptive_norm_decay", 0.99)),
         )
         self.smp_prior = self._load_prior_model()
         self.style_program = self._resolve_style_program_from_cfg()
+        if self.smp_reward.reward_mode == "target_vs_uncond" and self.style_program["mode"] == "unconditional":
+            raise ValueError("reward_mode='target_vs_uncond' requires a conditional SMP style program")
         self.gsi_sampler = self._build_gsi_sampler()
         self.git_status_repos.append(rsl_rl.__file__)
 
@@ -105,9 +108,17 @@ class SMPOnPolicyRunner(OnPolicyRunner):
         for it in range(start_iter, tot_iter):
             start = time.time()
             # 每轮迭代都统计 SMP 相关的均值，用来观察 prior 质量和 reset 重采样行为是否稳定。
+            iter_task_rewards = []
+            iter_task_rewards_scaled = []
             iter_smp_rewards = []
+            iter_smp_rewards_scaled = []
+            iter_combined_rewards = []
             iter_smp_noise = []
             iter_smp_cfg_gap = []
+            iter_smp_reward_targets = []
+            iter_smp_reward_unconds = []
+            iter_smp_reward_gaps = []
+            iter_smp_reward_finals = []
             iter_gsi_accept_rates = []
             iter_gsi_resample_counts = []
             iter_gsi_fallback_rates = []
@@ -127,16 +138,29 @@ class SMPOnPolicyRunner(OnPolicyRunner):
                     obs, gsi_diag = self._maybe_apply_gsi_reset(obs, dones)
 
                     smp_metrics = self._compute_smp_metrics(reward_obs)
-                    rewards = self._combine_rewards(rewards, smp_metrics["reward"])
+                    reward_terms = self._decompose_rewards(rewards, smp_metrics["reward"])
+                    rewards = reward_terms["combined"]
                     # process the step
                     self.alg.process_env_step(obs, rewards, dones, extras)
 
                     last_smp_eps = smp_metrics["eps"]
                     last_smp_eps_hat = smp_metrics["eps_hat"]
                     last_style_diag = smp_metrics["style_diag"]
+                    iter_task_rewards.append(float(reward_terms["task_raw"].mean().item()))
+                    iter_task_rewards_scaled.append(float(reward_terms["task_scaled"].mean().item()))
                     iter_smp_rewards.append(float(smp_metrics["reward"].mean().item()))
+                    iter_smp_rewards_scaled.append(float(reward_terms["smp_scaled"].mean().item()))
+                    iter_combined_rewards.append(float(reward_terms["combined"].mean().item()))
                     iter_smp_noise.append(float(smp_metrics["noise_mse"].mean().item()))
                     iter_smp_cfg_gap.append(float(smp_metrics["cond_uncond_gap"]))
+                    if "reward_target" in smp_metrics:
+                        iter_smp_reward_targets.append(float(smp_metrics["reward_target"].mean().item()))
+                    if "reward_uncond" in smp_metrics:
+                        iter_smp_reward_unconds.append(float(smp_metrics["reward_uncond"].mean().item()))
+                    if "reward_gap" in smp_metrics:
+                        iter_smp_reward_gaps.append(float(smp_metrics["reward_gap"].mean().item()))
+                    if "reward" in smp_metrics:
+                        iter_smp_reward_finals.append(float(smp_metrics["reward"].mean().item()))
                     iter_gsi_accept_rates.append(float(gsi_diag["reset_accept_rate"]))
                     iter_gsi_resample_counts.append(float(gsi_diag["reset_resample_count"]))
                     iter_gsi_fallback_rates.append(float(gsi_diag["fallback_rate"]))
@@ -200,8 +224,31 @@ class SMPOnPolicyRunner(OnPolicyRunner):
                     {
                         **locals(),
                         "smp_mean_reward": statistics.mean(iter_smp_rewards) if len(iter_smp_rewards) > 0 else 0.0,
+                        "smp_task_reward_raw": statistics.mean(iter_task_rewards) if len(iter_task_rewards) > 0 else 0.0,
+                        "smp_task_reward_scaled": (
+                            statistics.mean(iter_task_rewards_scaled) if len(iter_task_rewards_scaled) > 0 else 0.0
+                        ),
+                        "smp_style_reward_raw": statistics.mean(iter_smp_rewards) if len(iter_smp_rewards) > 0 else 0.0,
+                        "smp_style_reward_scaled": (
+                            statistics.mean(iter_smp_rewards_scaled) if len(iter_smp_rewards_scaled) > 0 else 0.0
+                        ),
+                        "smp_combined_reward": (
+                            statistics.mean(iter_combined_rewards) if len(iter_combined_rewards) > 0 else 0.0
+                        ),
                         "smp_noise_mse": statistics.mean(iter_smp_noise) if len(iter_smp_noise) > 0 else 0.0,
                         "smp_cfg_gap": statistics.mean(iter_smp_cfg_gap) if len(iter_smp_cfg_gap) > 0 else 0.0,
+                        "smp_reward_target": (
+                            statistics.mean(iter_smp_reward_targets) if len(iter_smp_reward_targets) > 0 else None
+                        ),
+                        "smp_reward_uncond": (
+                            statistics.mean(iter_smp_reward_unconds) if len(iter_smp_reward_unconds) > 0 else None
+                        ),
+                        "smp_reward_gap": (
+                            statistics.mean(iter_smp_reward_gaps) if len(iter_smp_reward_gaps) > 0 else None
+                        ),
+                        "smp_reward_final": (
+                            statistics.mean(iter_smp_reward_finals) if len(iter_smp_reward_finals) > 0 else None
+                        ),
                         "gsi_reset_accept_rate": statistics.mean(iter_gsi_accept_rates) if len(iter_gsi_accept_rates) > 0 else 0.0,
                         "gsi_reset_resample_count": statistics.mean(iter_gsi_resample_counts) if len(iter_gsi_resample_counts) > 0 else 0.0,
                         "gsi_fallback_rate": statistics.mean(iter_gsi_fallback_rates) if len(iter_gsi_fallback_rates) > 0 else 0.0,
@@ -240,6 +287,19 @@ class SMPOnPolicyRunner(OnPolicyRunner):
         # 这一组标量记录的是“训练过程的宏观健康度”：reward、噪声误差、CFG gap 和 GSI 重采样质量。
         # SMP 先验模块计算所得的模仿动作均值奖励
         self.writer.add_scalar("SMP/reward", locs["smp_mean_reward"], locs["it"])
+        self.writer.add_scalar("SMP/reward_terms/task_raw", float(locs["smp_task_reward_raw"]), locs["it"])
+        self.writer.add_scalar("SMP/reward_terms/task_scaled", float(locs["smp_task_reward_scaled"]), locs["it"])
+        self.writer.add_scalar("SMP/reward_terms/style_raw", float(locs["smp_style_reward_raw"]), locs["it"])
+        self.writer.add_scalar("SMP/reward_terms/style_scaled", float(locs["smp_style_reward_scaled"]), locs["it"])
+        self.writer.add_scalar("SMP/reward_terms/combined", float(locs["smp_combined_reward"]), locs["it"])
+        if locs.get("smp_reward_target") is not None:
+            self.writer.add_scalar("SMP/diff/reward_target", float(locs["smp_reward_target"]), locs["it"])
+        if locs.get("smp_reward_uncond") is not None:
+            self.writer.add_scalar("SMP/diff/reward_uncond", float(locs["smp_reward_uncond"]), locs["it"])
+        if locs.get("smp_reward_gap") is not None:
+            self.writer.add_scalar("SMP/diff/reward_gap", float(locs["smp_reward_gap"]), locs["it"])
+        if locs.get("smp_reward_final") is not None:
+            self.writer.add_scalar("SMP/diff/reward_final", float(locs["smp_reward_final"]), locs["it"])
         # 扩散先验在各个采样时间步上预测噪声的总 MSE 误差均值
         self.writer.add_scalar("SMP/cfg/noise_mse", float(locs["smp_noise_mse"]), locs["it"])
         # CFG 引导机制下，有条件预测与无条件预测的差异量（体现了注入条件对动作的影响强度）
@@ -285,6 +345,15 @@ class SMPOnPolicyRunner(OnPolicyRunner):
             )
             # 上下半身掩码叠加后，对整个机器人的关节动作特征维度占据的覆盖率
             self.writer.add_scalar("SMP/style_mask/coverage", float(locs["style_program"]["coverage"]), locs["it"])
+
+        print(
+            "SMP reward diagnostics:\n"
+            f"{'Mean task reward raw:':>{pad}} {float(locs['smp_task_reward_raw']):.4f}\n"
+            f"{'Mean task reward scaled:':>{pad}} {float(locs['smp_task_reward_scaled']):.4f}\n"
+            f"{'Mean SMP reward raw:':>{pad}} {float(locs['smp_style_reward_raw']):.4f}\n"
+            f"{'Mean SMP reward scaled:':>{pad}} {float(locs['smp_style_reward_scaled']):.4f}\n"
+            f"{'Mean combined reward:':>{pad}} {float(locs['smp_combined_reward']):.4f}"
+        )
 
         if locs["it"] % self.log_histograms_every == 0:
             log_smp_noise_metrics(
@@ -449,6 +518,11 @@ class SMPOnPolicyRunner(OnPolicyRunner):
         )
         decoder = SMPGSIDecoder(
             feature_layout=feature_layout,
+            joint_axes=(
+                torch.tensor(_cfg_get(self.style_cfg, "joint_axes", []), device=self.device, dtype=torch.float32)
+                if _cfg_get(self.style_cfg, "joint_axes", None)
+                else None
+            ),
             error_threshold=float(_cfg_get(self.gsi_cfg, "error_threshold", 1.0e-6)),
         )
         return SMPGSISampler(sampler=sampler, decoder=decoder)
@@ -625,11 +699,12 @@ class SMPOnPolicyRunner(OnPolicyRunner):
         """生成长度为 batch_size 的 style id 张量，供 prior 批量前向使用。"""
         return torch.full((batch_size,), int(style_id), device=self.device, dtype=torch.long)
 
-    def _predict_prior_eps(self, xt: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, dict[str, object]]:
+    def _predict_prior_eps(self, xt: torch.Tensor, t: torch.Tensor) -> tuple[dict[str, torch.Tensor], dict[str, object]]:
         """在给定 timestep 预测扩散噪声，并返回风格相关诊断信息。"""
         # 无条件模式最直接，prior 只依赖当前噪声状态和 timestep。
         if self.style_program["mode"] == "unconditional":
-            return self.smp_prior(xt, t), {"cond_uncond_gap": 0.0}
+            eps = self.smp_prior(xt, t)
+            return {"policy": eps, "target": eps, "uncond": eps}, {"cond_uncond_gap": 0.0}
 
         # classifier-free guidance 的常规做法是同时计算 uncond 和 cond，然后按 scale 融合。
         eps_uncond = self.smp_prior(xt, t, style_id=self._full_style_id(xt.shape[0], NULL_STYLE_ID))
@@ -640,7 +715,7 @@ class SMPOnPolicyRunner(OnPolicyRunner):
                 eps_cond,
                 float(self.style_program["guidance_scale"]),
             )
-            return eps_prior, {
+            return {"policy": eps_prior, "target": eps_cond, "uncond": eps_uncond}, {
                 "cond_uncond_gap": float((eps_cond - eps_uncond).abs().mean().item()),
                 "target_style_id": int(self.style_program["target_style_id"]),
             }
@@ -660,7 +735,7 @@ class SMPOnPolicyRunner(OnPolicyRunner):
             eps_cond_comp,
             guidance_scale,
         )
-        return eps_prior, {
+        return {"policy": eps_prior, "target": eps_cond_comp, "uncond": eps_uncond}, {
             "cond_uncond_gap": float((eps_cond_comp - eps_uncond).abs().mean().item()),
             "part_style_ids": dict(self.style_program["part_style_ids"]),
             "coverage": float(self.style_program["coverage"]),
@@ -684,6 +759,7 @@ class SMPOnPolicyRunner(OnPolicyRunner):
         x0 = self._restore_smp_window(obs)
         eps = {}
         eps_hat = {}
+        eps_hat_uncond = {} if self.smp_reward.reward_mode == "target_vs_uncond" else None
         cond_uncond_gaps = []
         style_diag = {}
         with torch.inference_mode():
@@ -692,21 +768,40 @@ class SMPOnPolicyRunner(OnPolicyRunner):
                 t = torch.full((x0.shape[0],), timestep, device=self.device, dtype=torch.long)
                 eps_t = torch.randn_like(x0)
                 xt = self.smp_scheduler.q_sample(x0, t, eps_t)
-                eps_hat_t, style_diag = self._predict_prior_eps(xt, t)
+                eps_outputs, style_diag = self._predict_prior_eps(xt, t)
                 eps[timestep] = eps_t
-                eps_hat[timestep] = eps_hat_t
+                if self.smp_reward.reward_mode == "target_vs_uncond":
+                    eps_hat[timestep] = eps_outputs["target"]
+                    assert eps_hat_uncond is not None
+                    eps_hat_uncond[timestep] = eps_outputs["uncond"]
+                else:
+                    eps_hat[timestep] = eps_outputs["policy"]
                 cond_uncond_gaps.append(float(style_diag.get("cond_uncond_gap", 0.0)))
-        metrics = self.smp_reward.compute(eps=eps, eps_hat=eps_hat)
+        metrics = self.smp_reward.compute(eps=eps, eps_hat=eps_hat, eps_hat_uncond=eps_hat_uncond)
         metrics["eps"] = eps
         metrics["eps_hat"] = eps_hat
+        if eps_hat_uncond is not None:
+            metrics["eps_hat_uncond"] = eps_hat_uncond
         metrics["style_diag"] = style_diag
         metrics["cond_uncond_gap"] = statistics.mean(cond_uncond_gaps) if cond_uncond_gaps else 0.0
         return metrics
 
-    def _combine_rewards(self, task_rewards: torch.Tensor, smp_rewards: torch.Tensor) -> torch.Tensor:
-        """按配置系数融合任务奖励与 SMP 奖励，并保持输出形状一致。"""
+    def _decompose_rewards(self, task_rewards: torch.Tensor, smp_rewards: torch.Tensor) -> dict[str, torch.Tensor]:
+        """拆分任务奖励、SMP 奖励及其加权后的组合结果，供训练与日志共用。"""
         # 保持 reward 形状与环境输出一致，只在必要时扩展维度后再做加权求和。
         if task_rewards.ndim == 2 and smp_rewards.ndim == 1:
             smp_rewards = smp_rewards.unsqueeze(-1)
         dt = self.env.unwrapped.step_dt
-        return self.task_reward_coef * task_rewards + self.smp_reward_coef * smp_rewards * dt
+        task_scaled = self.task_reward_coef * task_rewards
+        smp_scaled = self.smp_reward_coef * smp_rewards * dt
+        return {
+            "task_raw": task_rewards,
+            "task_scaled": task_scaled,
+            "smp_raw": smp_rewards,
+            "smp_scaled": smp_scaled,
+            "combined": task_scaled + smp_scaled,
+        }
+
+    def _combine_rewards(self, task_rewards: torch.Tensor, smp_rewards: torch.Tensor) -> torch.Tensor:
+        """按配置系数融合任务奖励与 SMP 奖励，并保持输出形状一致。"""
+        return self._decompose_rewards(task_rewards, smp_rewards)["combined"]

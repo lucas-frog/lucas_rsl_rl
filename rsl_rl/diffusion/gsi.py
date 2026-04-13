@@ -7,8 +7,12 @@ import torch
 from rsl_rl.diffusion.sampler import SMPDiffusionSampler
 
 
+def _normalize(vec: torch.Tensor) -> torch.Tensor:
+    return vec / vec.norm(dim=-1, keepdim=True).clamp_min(1.0e-8)
+
+
 def _normalize_quat(quat_wxyz: torch.Tensor) -> torch.Tensor:
-    return quat_wxyz / quat_wxyz.norm(dim=-1, keepdim=True).clamp_min(1.0e-8)
+    return _normalize(quat_wxyz)
 
 
 def _quat_conjugate(quat_wxyz: torch.Tensor) -> torch.Tensor:
@@ -31,15 +35,48 @@ def _quat_multiply(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _quat_apply(quat_wxyz: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+def _matrix_from_quat(quat_wxyz: torch.Tensor) -> torch.Tensor:
     quat_wxyz = _normalize_quat(quat_wxyz)
-    zeros = torch.zeros(*vec.shape[:-1], 1, device=vec.device, dtype=vec.dtype)
-    vec_quat = torch.cat((zeros, vec), dim=-1)
-    return _quat_multiply(_quat_multiply(quat_wxyz, vec_quat), _quat_conjugate(quat_wxyz))[..., 1:]
+    w, x, y, z = quat_wxyz.unbind(dim=-1)
+    return torch.stack(
+        (
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - z * w),
+            2.0 * (x * z + y * w),
+            2.0 * (x * y + z * w),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - x * w),
+            2.0 * (x * z - y * w),
+            2.0 * (y * z + x * w),
+            1.0 - 2.0 * (x * x + y * y),
+        ),
+        dim=-1,
+    ).reshape(*quat_wxyz.shape[:-1], 3, 3)
 
 
-def _quat_apply_inverse(quat_wxyz: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
-    return _quat_apply(_quat_conjugate(_normalize_quat(quat_wxyz)), vec)
+def _build_heading_frame_rotation(root_quat_wxyz: torch.Tensor) -> torch.Tensor:
+    root_rotation = _matrix_from_quat(root_quat_wxyz)
+    forward_w = root_rotation[..., :, 0]
+    fallback_w = root_rotation[..., :, 1]
+    up_w = torch.zeros_like(forward_w)
+    up_w[..., 2] = 1.0
+
+    forward_proj = forward_w - (forward_w * up_w).sum(dim=-1, keepdim=True) * up_w
+    fallback_proj = fallback_w - (fallback_w * up_w).sum(dim=-1, keepdim=True) * up_w
+    use_fallback = forward_proj.norm(dim=-1, keepdim=True) < 1.0e-6
+    x_axis_w = _normalize(torch.where(use_fallback, fallback_proj, forward_proj))
+    y_axis_w = up_w
+    z_axis_w = _normalize(torch.cross(x_axis_w, y_axis_w, dim=-1))
+    x_axis_w = _normalize(torch.cross(y_axis_w, z_axis_w, dim=-1))
+    return torch.stack((x_axis_w, y_axis_w, z_axis_w), dim=-1)
+
+
+def _world_to_local_frame(rotation_world_from_local: torch.Tensor, vec_w: torch.Tensor) -> torch.Tensor:
+    return torch.matmul(vec_w.unsqueeze(-2), rotation_world_from_local).squeeze(-2)
+
+
+def _local_to_world_frame(rotation_world_from_local: torch.Tensor, vec_local: torch.Tensor) -> torch.Tensor:
+    return torch.matmul(vec_local.unsqueeze(-2), rotation_world_from_local.transpose(-1, -2)).squeeze(-2)
 
 
 def _expand_batch_tensor(tensor: torch.Tensor, batch_size: int, name: str) -> torch.Tensor:
@@ -51,27 +88,86 @@ def _expand_batch_tensor(tensor: torch.Tensor, batch_size: int, name: str) -> to
     raise ValueError(f"Expected {name} shape ({batch_size}, D) or (D,), got {tuple(tensor.shape)}")
 
 
+def _joint_angle_offsets_to_rot6d(joint_angle_offsets: torch.Tensor, joint_axes: torch.Tensor) -> torch.Tensor:
+    normalized_axes = _normalize(joint_axes.to(device=joint_angle_offsets.device, dtype=joint_angle_offsets.dtype))
+    axis_shape = (1,) * (joint_angle_offsets.ndim - 1) + normalized_axes.shape
+    expanded_axes = normalized_axes.view(axis_shape)
+    half_angle = 0.5 * joint_angle_offsets
+    quat_wxyz = torch.cat(
+        (
+            torch.cos(half_angle).unsqueeze(-1),
+            expanded_axes * torch.sin(half_angle).unsqueeze(-1),
+        ),
+        dim=-1,
+    )
+    return _quat_to_rot6d(quat_wxyz)
+
+
+def _quat_to_rot6d(quat_wxyz: torch.Tensor) -> torch.Tensor:
+    return _matrix_from_quat(quat_wxyz)[..., :2].reshape(*quat_wxyz.shape[:-1], 6)
+
+
+def _rot6d_to_matrix(rot6d: torch.Tensor) -> torch.Tensor:
+    col_1 = torch.stack((rot6d[..., 0], rot6d[..., 2], rot6d[..., 4]), dim=-1)
+    col_2 = torch.stack((rot6d[..., 1], rot6d[..., 3], rot6d[..., 5]), dim=-1)
+    basis_1 = _normalize(col_1)
+    basis_2 = _normalize(col_2 - (basis_1 * col_2).sum(dim=-1, keepdim=True) * basis_1)
+    basis_3 = torch.cross(basis_1, basis_2, dim=-1)
+    return torch.stack((basis_1, basis_2, basis_3), dim=-1)
+
+
+def _joint_rot6d_to_angle_offsets(joint_rot6d: torch.Tensor, joint_axes: torch.Tensor) -> torch.Tensor:
+    rotmat = _rot6d_to_matrix(joint_rot6d)
+    normalized_axes = _normalize(joint_axes.to(device=joint_rot6d.device, dtype=joint_rot6d.dtype))
+    axis_shape = (1,) * (joint_rot6d.ndim - 2) + normalized_axes.shape
+    expanded_axes = normalized_axes.view(axis_shape)
+    cos_theta = ((torch.diagonal(rotmat, dim1=-2, dim2=-1).sum(dim=-1) - 1.0) * 0.5).clamp(-1.0, 1.0)
+    skew_vec = torch.stack(
+        (
+            rotmat[..., 2, 1] - rotmat[..., 1, 2],
+            rotmat[..., 0, 2] - rotmat[..., 2, 0],
+            rotmat[..., 1, 0] - rotmat[..., 0, 1],
+        ),
+        dim=-1,
+    )
+    sin_theta = 0.5 * (skew_vec * expanded_axes).sum(dim=-1)
+    return torch.atan2(sin_theta, cos_theta)
+
+
 @dataclass(frozen=True)
 class SMPFeatureLayout:
     feature_dim: int
     base_lin_vel_b: tuple[int, int]
     base_ang_vel_b: tuple[int, int]
-    joint_pos_rel: tuple[int, int]
+    joint_pos_rel: tuple[int, int] | None = None
+    joint_rot6d_rel: tuple[int, int] | None = None
     ee_pos_b: tuple[int, int] | None = None
     key_body_rot6d: tuple[int, int] | None = None
 
     @classmethod
     def from_feature_block_offsets(cls, feature_block_offsets: dict[str, tuple[int, int]]):
-        required_keys = ("base_lin_vel_b", "base_ang_vel_b", "joint_pos_rel")
+        required_keys = ("base_lin_vel_b", "base_ang_vel_b")
         missing_keys = [key for key in required_keys if key not in feature_block_offsets]
         if missing_keys:
             raise KeyError(f"Missing required feature block offsets: {missing_keys}")
+        if "joint_rot6d_rel" not in feature_block_offsets and "joint_pos_rel" not in feature_block_offsets:
+            raise KeyError("Missing required feature block offsets: ['joint_rot6d_rel' or 'joint_pos_rel']")
+
         feature_dim = max(int(stop) for _, stop in feature_block_offsets.values())
         return cls(
             feature_dim=feature_dim,
             base_lin_vel_b=tuple(map(int, feature_block_offsets["base_lin_vel_b"])),
             base_ang_vel_b=tuple(map(int, feature_block_offsets["base_ang_vel_b"])),
-            joint_pos_rel=tuple(map(int, feature_block_offsets["joint_pos_rel"])),
+            joint_pos_rel=(
+                tuple(map(int, feature_block_offsets["joint_pos_rel"]))
+                if "joint_pos_rel" in feature_block_offsets
+                else None
+            ),
+            joint_rot6d_rel=(
+                tuple(map(int, feature_block_offsets["joint_rot6d_rel"]))
+                if "joint_rot6d_rel" in feature_block_offsets
+                else None
+            ),
             ee_pos_b=(
                 tuple(map(int, feature_block_offsets["ee_pos_b"]))
                 if "ee_pos_b" in feature_block_offsets
@@ -85,8 +181,30 @@ class SMPFeatureLayout:
         )
 
     @property
+    def joint_block_name(self) -> str:
+        if self.joint_rot6d_rel is not None:
+            return "joint_rot6d_rel"
+        if self.joint_pos_rel is not None:
+            return "joint_pos_rel"
+        raise ValueError("Feature layout does not define any joint feature block")
+
+    @property
+    def joint_block(self) -> tuple[int, int]:
+        if self.joint_rot6d_rel is not None:
+            return self.joint_rot6d_rel
+        if self.joint_pos_rel is not None:
+            return self.joint_pos_rel
+        raise ValueError("Feature layout does not define any joint feature block")
+
+    @property
     def joint_dim(self) -> int:
-        return self.joint_pos_rel[1] - self.joint_pos_rel[0]
+        start, stop = self.joint_block
+        if self.joint_rot6d_rel is not None:
+            width = stop - start
+            if width % 6 != 0:
+                raise ValueError("joint_rot6d_rel block width must be divisible by 6")
+            return width // 6
+        return stop - start
 
 
 @dataclass
@@ -118,9 +236,23 @@ class SMPGSIDecodeResult:
 class SMPGSIDecoder:
     """把采样得到的 SMP 窗口解码成 reset state，并显式报告可恢复块的误差。"""
 
-    def __init__(self, feature_layout: SMPFeatureLayout, error_threshold: float = 1.0e-6):
+    def __init__(
+        self,
+        feature_layout: SMPFeatureLayout,
+        joint_axes: torch.Tensor | None = None,
+        error_threshold: float = 1.0e-6,
+    ):
         self.feature_layout = feature_layout
         self.error_threshold = float(error_threshold)
+        if self.feature_layout.joint_rot6d_rel is not None and joint_axes is None:
+            raise ValueError("joint_axes is required when decoding joint_rot6d_rel features")
+        if joint_axes is not None:
+            joint_axes = joint_axes.to(dtype=torch.float32)
+            if joint_axes.shape != (self.feature_layout.joint_dim, 3):
+                raise ValueError(
+                    f"Expected joint_axes shape ({self.feature_layout.joint_dim}, 3), got {tuple(joint_axes.shape)}"
+                )
+        self.joint_axes = joint_axes
 
     def _unrecoverable_feature_blocks(self) -> tuple[str, ...]:
         missing = []
@@ -131,25 +263,29 @@ class SMPGSIDecoder:
         return tuple(missing)
 
     def _recoverable_target(self, last_frame: torch.Tensor) -> torch.Tensor:
+        joint_start, joint_stop = self.feature_layout.joint_block
         return torch.cat(
             (
                 last_frame[:, self.feature_layout.base_lin_vel_b[0] : self.feature_layout.base_lin_vel_b[1]],
                 last_frame[:, self.feature_layout.base_ang_vel_b[0] : self.feature_layout.base_ang_vel_b[1]],
-                last_frame[:, self.feature_layout.joint_pos_rel[0] : self.feature_layout.joint_pos_rel[1]],
+                last_frame[:, joint_start:joint_stop],
             ),
             dim=-1,
         )
 
     def _recoverable_reencode(self, state: SMPResetState, reference_state: SMPResetReference) -> torch.Tensor:
         joint_pos_default = _expand_batch_tensor(reference_state.joint_pos, state.joint_pos.shape[0], "joint_pos")
-        return torch.cat(
-            (
-                _quat_apply_inverse(state.root_quat_w, state.root_lin_vel_w),
-                _quat_apply_inverse(state.root_quat_w, state.root_ang_vel_w),
-                state.joint_pos - joint_pos_default,
-            ),
-            dim=-1,
-        )
+        heading_rotation = _build_heading_frame_rotation(state.root_quat_w)
+        reencoded = [
+            _world_to_local_frame(heading_rotation, state.root_lin_vel_w),
+            _world_to_local_frame(heading_rotation, state.root_ang_vel_w),
+        ]
+        if self.feature_layout.joint_rot6d_rel is not None:
+            joint_rot6d = _joint_angle_offsets_to_rot6d(state.joint_pos - joint_pos_default, self.joint_axes)
+            reencoded.append(joint_rot6d.reshape(state.joint_pos.shape[0], -1))
+        else:
+            reencoded.append(state.joint_pos - joint_pos_default)
+        return torch.cat(reencoded, dim=-1)
 
     def decode(self, window: torch.Tensor, reference_state: SMPResetReference) -> SMPGSIDecodeResult:
         if window.ndim != 3:
@@ -162,7 +298,7 @@ class SMPGSIDecoder:
         last_frame = window[:, -1].to(dtype=torch.float32)
 
         root_pos_w = _expand_batch_tensor(reference_state.root_pos_w, batch_size, "root_pos_w")
-        root_quat_w = _expand_batch_tensor(reference_state.root_quat_w, batch_size, "root_quat_w")
+        root_quat_w = _normalize_quat(_expand_batch_tensor(reference_state.root_quat_w, batch_size, "root_quat_w"))
         joint_pos_default = _expand_batch_tensor(reference_state.joint_pos, batch_size, "joint_pos")
         if reference_state.joint_vel is None:
             joint_vel = torch.zeros_like(joint_pos_default)
@@ -171,14 +307,21 @@ class SMPGSIDecoder:
 
         base_lin_vel_b = last_frame[:, self.feature_layout.base_lin_vel_b[0] : self.feature_layout.base_lin_vel_b[1]]
         base_ang_vel_b = last_frame[:, self.feature_layout.base_ang_vel_b[0] : self.feature_layout.base_ang_vel_b[1]]
-        joint_pos_rel = last_frame[:, self.feature_layout.joint_pos_rel[0] : self.feature_layout.joint_pos_rel[1]]
+        heading_rotation = _build_heading_frame_rotation(root_quat_w)
+
+        joint_start, joint_stop = self.feature_layout.joint_block
+        if self.feature_layout.joint_rot6d_rel is not None:
+            joint_rot6d_rel = last_frame[:, joint_start:joint_stop].view(batch_size, self.feature_layout.joint_dim, 6)
+            joint_angle_offsets = _joint_rot6d_to_angle_offsets(joint_rot6d_rel, self.joint_axes)
+        else:
+            joint_angle_offsets = last_frame[:, joint_start:joint_stop]
 
         state = SMPResetState(
             root_pos_w=root_pos_w,
-            root_quat_w=_normalize_quat(root_quat_w),
-            root_lin_vel_w=_quat_apply(root_quat_w, base_lin_vel_b),
-            root_ang_vel_w=_quat_apply(root_quat_w, base_ang_vel_b),
-            joint_pos=joint_pos_default + joint_pos_rel,
+            root_quat_w=root_quat_w,
+            root_lin_vel_w=_local_to_world_frame(heading_rotation, base_lin_vel_b),
+            root_ang_vel_w=_local_to_world_frame(heading_rotation, base_ang_vel_b),
+            joint_pos=joint_pos_default + joint_angle_offsets,
             joint_vel=joint_vel,
         )
         target = self._recoverable_target(last_frame)

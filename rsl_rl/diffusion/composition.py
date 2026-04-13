@@ -62,6 +62,13 @@ def _ensure_feature_block(feature_block_offsets: dict[str, tuple[int, int]], key
     return int(start), int(stop)
 
 
+def _find_joint_feature_block(feature_block_offsets: dict[str, tuple[int, int]]) -> tuple[str, tuple[int, int]]:
+    for key in ("joint_rot6d_rel", "joint_pos_rel"):
+        if key in feature_block_offsets:
+            return key, tuple(map(int, feature_block_offsets[key]))
+    raise KeyError("Missing feature block offset for either 'joint_rot6d_rel' or 'joint_pos_rel'")
+
+
 def _validate_masks(feature_masks: dict[str, torch.Tensor]) -> None:
     if not feature_masks:
         raise ValueError("feature_masks must be non-empty")
@@ -94,17 +101,20 @@ def build_g1_body_part_feature_masks(
     masks["shared_body"][base_lin_start:base_lin_stop] = 1.0
     masks["shared_body"][base_ang_start:base_ang_stop] = 1.0
 
-    joint_start, joint_stop = _ensure_feature_block(feature_block_offsets, "joint_pos_rel")
-    if joint_stop - joint_start != len(joint_name_order):
-        raise ValueError("joint_pos_rel block size does not match joint_name_order")
+    _, (joint_start, joint_stop) = _find_joint_feature_block(feature_block_offsets)
+    joint_block_size = joint_stop - joint_start
+    if joint_block_size % len(joint_name_order) != 0:
+        raise ValueError("Joint feature block size does not divide evenly by joint_name_order")
+    joint_width = joint_block_size // len(joint_name_order)
     for offset, joint_name in enumerate(joint_name_order):
-        index = joint_start + offset
+        start = joint_start + offset * joint_width
+        stop = start + joint_width
         if joint_name in _G1_LOWER_BODY_JOINTS:
-            masks["lower_body"][index] = 1.0
+            masks["lower_body"][start:stop] = 1.0
         elif joint_name in _G1_SHARED_BODY_JOINTS:
-            masks["shared_body"][index] = 1.0
+            masks["shared_body"][start:stop] = 1.0
         elif joint_name in _G1_UPPER_BODY_JOINTS:
-            masks["upper_body"][index] = 1.0
+            masks["upper_body"][start:stop] = 1.0
         else:
             raise ValueError(f"Unknown G1 joint in mask template: {joint_name}")
 
@@ -120,19 +130,20 @@ def build_g1_body_part_feature_masks(
         else:
             raise ValueError(f"Unknown G1 end-effector in mask template: {ee_name}")
 
-    key_start, key_stop = _ensure_feature_block(feature_block_offsets, "key_body_rot6d")
-    key_width = (key_stop - key_start) // len(key_body_name_order)
-    for offset, body_name in enumerate(key_body_name_order):
-        start = key_start + offset * key_width
-        stop = start + key_width
-        if body_name in _G1_SHARED_KEY_BODIES:
-            masks["shared_body"][start:stop] = 1.0
-        elif body_name in _G1_LOWER_KEY_BODIES:
-            masks["lower_body"][start:stop] = 1.0
-        elif body_name in _G1_UPPER_KEY_BODIES:
-            masks["upper_body"][start:stop] = 1.0
-        else:
-            raise ValueError(f"Unknown G1 key body in mask template: {body_name}")
+    if "key_body_rot6d" in feature_block_offsets:
+        key_start, key_stop = _ensure_feature_block(feature_block_offsets, "key_body_rot6d")
+        key_width = (key_stop - key_start) // len(key_body_name_order)
+        for offset, body_name in enumerate(key_body_name_order):
+            start = key_start + offset * key_width
+            stop = start + key_width
+            if body_name in _G1_SHARED_KEY_BODIES:
+                masks["shared_body"][start:stop] = 1.0
+            elif body_name in _G1_LOWER_KEY_BODIES:
+                masks["lower_body"][start:stop] = 1.0
+            elif body_name in _G1_UPPER_KEY_BODIES:
+                masks["upper_body"][start:stop] = 1.0
+            else:
+                raise ValueError(f"Unknown G1 key body in mask template: {body_name}")
 
     _validate_masks(masks)
     return masks

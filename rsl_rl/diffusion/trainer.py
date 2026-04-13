@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import time
 from pathlib import Path
 
 import torch
@@ -53,10 +55,18 @@ class SMPDiffusionTrainer:
     ):
         self.dataset_path = Path(dataset_path)
         self.log_dir = Path(log_dir)
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        if max_iters <= 0:
+            raise ValueError(f"max_iters must be positive, got {max_iters}")
         self.batch_size = batch_size
         self.max_iters = max_iters
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        self.timesteps_k = list(timesteps_k)
+        self.timesteps_k = [int(timestep) for timestep in timesteps_k]
+        if len(self.timesteps_k) == 0:
+            raise ValueError("timesteps_k must be non-empty")
+        if any(timestep < 0 or timestep >= num_diffusion_steps for timestep in self.timesteps_k):
+            raise ValueError(f"timesteps_k must stay within [0, {num_diffusion_steps - 1}]")
         self.style_drop_prob = style_drop_prob
 
         self.dataset = SMPMotionWindowDataset(self.dataset_path, window_size=window_size, stride=stride)
@@ -99,6 +109,8 @@ class SMPDiffusionTrainer:
 
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.writer = SummaryWriter(log_dir=str(self.log_dir), flush_secs=10)
+        self._steps_per_epoch = max(1, math.ceil(len(self.dataset) / self.batch_size))
+        self._console_log_interval = max(1, min(50, self.max_iters // 20))
 
     def _next_batch(self) -> dict[str, object]:
         """获取下一批数据，并把张量字段移动到目标设备。"""
@@ -124,11 +136,15 @@ class SMPDiffusionTrainer:
         torch.Tensor | None,
         dict[str, torch.Tensor],
     ]:
-        """执行一次前向扩散与噪声预测，返回损失和日志统计。"""
+        """执行一次前向扩散与噪声预测，返回损失和日志统计。
+
+        预训练阶段遵循标准 DDPM：时间步从 [0, num_steps) 全范围均匀采样。
+        固定的 ``timesteps_k`` 只用于 reward 对齐诊断与 checkpoint 元数据。
+        """
         x0 = batch["motion"]
         style_id = batch["style_id"] if isinstance(batch["style_id"], torch.Tensor) else None
 
-        t = self.scheduler.sample_timesteps(x0.shape[0], device=self.device, timesteps_k=self.timesteps_k)
+        t = self.scheduler.sample_timesteps(x0.shape[0], device=self.device)
         eps = torch.randn_like(x0)
         xt = self.scheduler.q_sample(x0, t, eps)
         dropped_style_id = maybe_drop_style(style_id, self.style_drop_prob, null_style_id=NULL_STYLE_ID)
@@ -167,6 +183,99 @@ class SMPDiffusionTrainer:
 
         return loss, per_timestep_mse, eps, eps_hat, loss_cond, loss_uncond, per_style_mse
 
+    @staticmethod
+    def _to_float(value: float | torch.Tensor | None) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return float(value.detach().float().mean().item())
+        return float(value)
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        total_seconds = max(0, int(round(seconds)))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    @staticmethod
+    def _format_optional_metric(value: float | torch.Tensor | None, precision: int = 6) -> str:
+        numeric = SMPDiffusionTrainer._to_float(value)
+        if numeric is None:
+            return "n/a"
+        return f"{numeric:.{precision}f}"
+
+    def _print_training_header(self) -> None:
+        width = 100
+        pad = 38
+        log_string = (
+            f"{'=' * width}\n"
+            f"{'[SMP Pretrain] Starting'.center(width, ' ')}\n\n"
+            f"{'Dataset:':>{pad}} {self.dataset_path}\n"
+            f"{'Windows:':>{pad}} {len(self.dataset)}\n"
+            f"{'Batch size:':>{pad}} {self.batch_size}\n"
+            f"{'Device:':>{pad}} {self.device}\n"
+            f"{'Max iterations:':>{pad}} {self.max_iters}\n"
+            f"{'Diffusion steps:':>{pad}} {self.scheduler.num_steps}\n"
+            f"{'Pretrain timesteps:':>{pad}} uniform[0, {self.scheduler.num_steps - 1}]\n"
+            f"{'Reward timesteps k:':>{pad}} {self.timesteps_k}\n"
+            f"{'Steps per epoch:':>{pad}} {self._steps_per_epoch}\n"
+            f"{'=' * width}\n"
+        )
+        print(log_string, flush=True)
+
+    def _should_log_step(self, global_step: int) -> bool:
+        return global_step == 1 or global_step == self.max_iters or global_step % self._console_log_interval == 0
+
+    def _print_training_progress(
+        self,
+        global_step: int,
+        loss: float,
+        mean_loss: float,
+        per_timestep_mse: dict[int, torch.Tensor],
+        loss_cond: float | torch.Tensor | None,
+        loss_uncond: float | torch.Tensor | None,
+        start_time: float,
+        iteration_time: float,
+    ) -> None:
+        width = 100
+        pad = 38
+        epoch = (global_step - 1) // self._steps_per_epoch + 1
+        epoch_step = (global_step - 1) % self._steps_per_epoch + 1
+        elapsed = max(time.perf_counter() - start_time, 1.0e-6)
+        progress = 100.0 * global_step / self.max_iters
+        estimated_total_time = elapsed / global_step * self.max_iters
+        remaining_time = max(0.0, estimated_total_time - elapsed)
+        samples_per_sec = self.batch_size / max(iteration_time, 1.0e-6)
+        lr = float(self.optimizer.param_groups[0]["lr"])
+        log_string = (
+            f"{'-' * width}\n"
+            f"{f' Learning iteration {global_step}/{self.max_iters} '.center(width, ' ')}\n\n"
+            f"{'Computation:':>{pad}} {samples_per_sec:.0f} windows/s (iteration: {iteration_time:.3f}s, batch {self.batch_size})\n"
+            f"{'Progress:':>{pad}} {progress:.1f}%\n"
+            f"{'Epoch:':>{pad}} {epoch}\n"
+            f"{'Epoch iteration:':>{pad}} {epoch_step}/{self._steps_per_epoch}\n"
+            f"{'Mean loss:':>{pad}} {loss:.6f}\n"
+            f"{'Mean loss (running):':>{pad}} {mean_loss:.6f}\n"
+            f"{'Conditional loss:':>{pad}} {self._format_optional_metric(loss_cond)}\n"
+            f"{'Unconditional loss:':>{pad}} {self._format_optional_metric(loss_uncond)}\n"
+            f"{'Learning rate:':>{pad}} {lr:.2e}\n"
+            f"{'Samples seen:':>{pad}} {global_step * self.batch_size}\n"
+        )
+        for timestep in self.timesteps_k:
+            mse = per_timestep_mse.get(int(timestep))
+            log_string += (
+                f"{f'Reward-k t{timestep} noise mse:':>{pad}} "
+                f"{self._format_optional_metric(mse, precision=4)}\n"
+            )
+        log_string += (
+            f"{'Iteration time:':>{pad}} {iteration_time:.2f}s\n"
+            f"{'Time elapsed:':>{pad}} {self._format_duration(elapsed)}\n"
+            f"{'Estimated total time:':>{pad}} {self._format_duration(estimated_total_time)}\n"
+            f"{'Time remaining:':>{pad}} {self._format_duration(remaining_time)}\n"
+        )
+        print(log_string, flush=True)
+
     def save_checkpoint(self, output_path: str | Path | None = None) -> Path:
         """保存模型、EMA、优化器状态及关键配置。"""
         checkpoint_path = Path(output_path) if output_path is not None else self.log_dir / "model_latest.pt"
@@ -198,8 +307,12 @@ class SMPDiffusionTrainer:
 
     def train(self) -> dict[str, object]:
         """执行离线预训练循环，并返回最终损失与产物路径。"""
+        self._print_training_header()
         final_loss = None
+        mean_loss = 0.0
+        start_time = time.perf_counter()
         for global_step in range(1, self.max_iters + 1):
+            iteration_start_time = time.perf_counter()
             batch = self._next_batch()
             loss, per_timestep_mse, eps, eps_hat, loss_cond, loss_uncond, per_style_mse = self._compute_loss(batch)
 
@@ -209,6 +322,7 @@ class SMPDiffusionTrainer:
             self.ema.update(self.model)
 
             final_loss = float(loss.detach().cpu().item())
+            mean_loss += (final_loss - mean_loss) / global_step
 
             log_smp_pretrain_metrics(
                 self.writer,
@@ -222,9 +336,33 @@ class SMPDiffusionTrainer:
                 per_style_mse=per_style_mse,
             )
 
+            if self._should_log_step(global_step):
+                self._print_training_progress(
+                    global_step=global_step,
+                    loss=final_loss,
+                    mean_loss=mean_loss,
+                    per_timestep_mse=per_timestep_mse,
+                    loss_cond=loss_cond,
+                    loss_uncond=loss_uncond,
+                    start_time=start_time,
+                    iteration_time=time.perf_counter() - iteration_start_time,
+                )
+
         checkpoint_path = self.save_checkpoint()
         self.writer.flush()
         self.writer.close()
+        total_time = time.perf_counter() - start_time
+        width = 100
+        pad = 38
+        log_string = (
+            f"{'=' * width}\n"
+            f"{'[SMP Pretrain] Finished'.center(width, ' ')}\n\n"
+            f"{'Final loss:':>{pad}} {final_loss:.6f}\n"
+            f"{'Checkpoint:':>{pad}} {checkpoint_path}\n"
+            f"{'Total training time:':>{pad}} {self._format_duration(total_time)}\n"
+            f"{'=' * width}\n"
+        )
+        print(log_string, flush=True)
         return {
             "checkpoint_path": checkpoint_path,
             "final_loss": final_loss,
