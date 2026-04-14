@@ -74,11 +74,14 @@ class SMPOnPolicyRunner(OnPolicyRunner):
         self.smp_checkpoint = checkpoint
         self.smp_checkpoint_style_cfg = checkpoint.get("style_cfg", {})
         model_cfg = checkpoint.get("model_cfg", {})
+        raw_model_state = checkpoint["model_state_dict"]
+        ema_state = checkpoint.get("ema_state_dict", {})
+        ema_model_state = ema_state.get("shadow_state") if isinstance(ema_state, dict) else None
         feature_dim = int(model_cfg.get("feature_dim", self.smp_prior_cfg["feature_dim"]))
         window_size = int(model_cfg.get("window_size", self.smp_prior_cfg["window_size"]))
         num_diffusion_steps = int(model_cfg.get("num_diffusion_steps", self.smp_prior_cfg["num_diffusion_steps"]))
         num_styles = int(model_cfg.get("num_styles", 0))
-        hidden_dim = int(model_cfg.get("hidden_dim", checkpoint["model_state_dict"]["token_proj.weight"].shape[0]))
+        hidden_dim = int(model_cfg["hidden_dim"]) if "hidden_dim" in model_cfg else int(raw_model_state["token_proj.weight"].shape[0])
         num_layers = int(model_cfg.get("num_layers", 2))
         num_heads = int(model_cfg.get("num_heads", 8))
 
@@ -91,7 +94,7 @@ class SMPOnPolicyRunner(OnPolicyRunner):
             num_layers=num_layers,
             num_heads=num_heads,
         ).to(self.device)
-        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        model.load_state_dict(ema_model_state if ema_model_state is not None else raw_model_state, strict=True)
         model.eval()
         for parameter in model.parameters():
             # 冻结 prior，保证训练过程只更新 PPO policy，而不会破坏已学到的扩散先验。
@@ -319,6 +322,32 @@ class SMPOnPolicyRunner(OnPolicyRunner):
             "coverage": float(self.style_program["coverage"]),
         }
 
+    def _build_smp_reward_obs(self, obs, dones, extras):
+        """为 SMP reward 构造观测视图：done 环境使用 terminal_observation，其余环境保持当前观测。"""
+        done_mask = dones > 0
+        if done_mask.ndim > 1:
+            done_mask = done_mask.view(done_mask.shape[0], -1).any(dim=1)
+        if not bool(done_mask.any()):
+            return obs
+
+        terminal_obs = extras.get("terminal_observation") if isinstance(extras, dict) else None
+        if terminal_obs is None:
+            return obs
+
+        if isinstance(terminal_obs, dict):
+            if self.smp_obs_group not in terminal_obs:
+                return obs
+            terminal_smp_obs = terminal_obs[self.smp_obs_group]
+        else:
+            terminal_smp_obs = terminal_obs
+
+        reward_obs = obs.clone() if hasattr(obs, "clone") else dict(obs)
+        reward_obs[self.smp_obs_group] = obs[self.smp_obs_group].clone()
+        if hasattr(terminal_smp_obs, "to"):
+            terminal_smp_obs = terminal_smp_obs.to(self.device)
+        reward_obs[self.smp_obs_group][done_mask] = terminal_smp_obs
+        return reward_obs
+
     def _restore_smp_window(self, obs) -> torch.Tensor:
         """从观测中恢复 SMP 时间窗张量，并校验展平维度是否匹配配置。"""
         if self.smp_obs_group not in obs:
@@ -362,7 +391,7 @@ class SMPOnPolicyRunner(OnPolicyRunner):
         if task_rewards.ndim == 2 and smp_rewards.ndim == 1:
             smp_rewards = smp_rewards.unsqueeze(-1)
         dt = self.env.unwrapped.step_dt
-        return self.task_reward_coef * task_rewards + self.smp_reward_coef * smp_rewards * dt
+        return self.task_reward_coef * task_rewards + self.smp_reward_coef * smp_rewards   # * dt
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         """记录 PPO 与 SMP 相关日志，包括风格程序、噪声指标和 GSI 统计。"""
@@ -419,12 +448,31 @@ class SMPOnPolicyRunner(OnPolicyRunner):
             # 上下半身掩码叠加后，对整个机器人的关节动作特征维度占据的覆盖率
             self.writer.add_scalar("SMP/style_mask/coverage", float(locs["style_program"]["coverage"]), locs["it"])
 
+        per_timestep_mse = dict(locs["smp_per_timestep_mse"])
+        timestep_order = list(getattr(self.smp_reward, "timesteps_k", []))
+        timestep_order.extend(
+            timestep for timestep in sorted(per_timestep_mse.keys(), reverse=True) if timestep not in timestep_order
+        )
+        timestep_summary = ", ".join(
+            f"t{timestep}={float(per_timestep_mse[timestep]):.4f}"
+            for timestep in timestep_order
+            if timestep in per_timestep_mse
+        )
+        smp_log_string = (
+            f"{f'SMP reward:':>{pad}} {float(locs['smp_mean_reward']):.4f}\n"
+            f"{f'SMP noise mse:':>{pad}} {float(locs['smp_noise_mse']):.4f}\n"
+            f"{f'SMP cfg gap:':>{pad}} {float(locs['smp_cfg_gap']):.4f}\n"
+        )
+        if timestep_summary:
+            smp_log_string += f"{f'SMP per-timestep:':>{pad}} {timestep_summary}\n"
+        print(smp_log_string, end="")
+
         if locs["it"] % self.log_histograms_every == 0:
             log_smp_noise_metrics(
                 self.writer,
                 global_step=locs["it"],
                 noise_mse=locs["smp_noise_mse"],
-                per_timestep_mse=locs["smp_per_timestep_mse"],
+                per_timestep_mse=per_timestep_mse,
                 eps=locs["smp_eps"],
                 eps_hat=locs["smp_eps_hat"],
                 prefix="SMP",
@@ -433,7 +481,7 @@ class SMPOnPolicyRunner(OnPolicyRunner):
 
         # 每轮迭代都常规上报噪声计算的总验证 MSE，维持监控曲线稳定
         self.writer.add_scalar("SMP/noise_mse", float(locs["smp_noise_mse"]), locs["it"])
-        for timestep, mse in sorted(locs["smp_per_timestep_mse"].items()):
+        for timestep, mse in sorted(per_timestep_mse.items()):
             # 将误差细分到每个特定的扩散采样时间步(timestep)，用于诊断模型对早晚期噪声的还原状况
             self.writer.add_scalar(f"SMP/t{timestep}/noise_mse", float(mse), locs["it"])
 
@@ -506,7 +554,8 @@ class SMPOnPolicyRunner(OnPolicyRunner):
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     obs, gsi_diag = self._maybe_apply_gsi_reset(obs, dones)
 
-                    smp_metrics = self._compute_smp_metrics(obs)
+                    smp_reward_obs = self._build_smp_reward_obs(obs, dones, extras)
+                    smp_metrics = self._compute_smp_metrics(smp_reward_obs)
                     rewards = self._combine_rewards(rewards, smp_metrics["reward"])
                     # process the step
                     self.alg.process_env_step(obs, rewards, dones, extras)

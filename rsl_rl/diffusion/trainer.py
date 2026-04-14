@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
+from tqdm import tqdm
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -15,7 +16,6 @@ from rsl_rl.motion import SMPMotionWindowDataset
 
 
 def _collate_smp_samples(samples: list[dict[str, object]]) -> dict[str, object]:
-    """将带元数据的 sample 聚合成 batch。"""
     motions = torch.stack([sample["motion"] for sample in samples], dim=0)
     style_ids = [sample["style_id"] for sample in samples]
     return {
@@ -101,7 +101,6 @@ class SMPDiffusionTrainer:
         self.writer = SummaryWriter(log_dir=str(self.log_dir), flush_secs=10)
 
     def _next_batch(self) -> dict[str, object]:
-        """获取下一批数据，并把张量字段移动到目标设备。"""
         try:
             batch = next(self._dataloader_iter)
         except StopIteration:
@@ -124,11 +123,10 @@ class SMPDiffusionTrainer:
         torch.Tensor | None,
         dict[str, torch.Tensor],
     ]:
-        """执行一次前向扩散与噪声预测，返回损失和日志统计。"""
         x0 = batch["motion"]
         style_id = batch["style_id"] if isinstance(batch["style_id"], torch.Tensor) else None
 
-        t = self.scheduler.sample_timesteps(x0.shape[0], device=self.device, timesteps_k=self.timesteps_k)
+        t = self.scheduler.sample_timesteps(x0.shape[0], device=self.device)
         eps = torch.randn_like(x0)
         xt = self.scheduler.q_sample(x0, t, eps)
         dropped_style_id = maybe_drop_style(style_id, self.style_drop_prob, null_style_id=NULL_STYLE_ID)
@@ -137,7 +135,7 @@ class SMPDiffusionTrainer:
         sample_mse = (eps_hat - eps).pow(2).flatten(start_dim=1).mean(dim=1)
         loss = sample_mse.mean()
 
-        per_timestep_mse = {}
+        per_timestep_mse: dict[int, torch.Tensor] = {}
         for timestep in self.timesteps_k:
             timestep_mask = t == timestep
             if torch.any(timestep_mask):
@@ -168,7 +166,6 @@ class SMPDiffusionTrainer:
         return loss, per_timestep_mse, eps, eps_hat, loss_cond, loss_uncond, per_style_mse
 
     def save_checkpoint(self, output_path: str | Path | None = None) -> Path:
-        """保存模型、EMA、优化器状态及关键配置。"""
         checkpoint_path = Path(output_path) if output_path is not None else self.log_dir / "model_latest.pt"
         checkpoint = {
             "model_state_dict": self.model.state_dict(),
@@ -183,8 +180,8 @@ class SMPDiffusionTrainer:
                 "num_diffusion_steps": self.scheduler.num_steps,
                 "num_styles": self.num_styles,
                 "hidden_dim": self.model.hidden_dim,
-                "num_layers": len(self.model.encoder.layers),
-                "num_heads": self.model.encoder.layers[0].self_attn.num_heads,
+                "num_layers": self.model.num_layers,
+                "num_heads": self.model.num_heads,
             },
             "style_cfg": {
                 "style_names": list(self.dataset.style_names),
@@ -197,9 +194,8 @@ class SMPDiffusionTrainer:
         return checkpoint_path
 
     def train(self) -> dict[str, object]:
-        """执行离线预训练循环，并返回最终损失与产物路径。"""
         final_loss = None
-        for global_step in range(1, self.max_iters + 1):
+        for global_step in tqdm(range(1, self.max_iters + 1), desc="SMP Diffusion Training", unit="iter"):
             batch = self._next_batch()
             loss, per_timestep_mse, eps, eps_hat, loss_cond, loss_uncond, per_style_mse = self._compute_loss(batch)
 
