@@ -7,6 +7,9 @@ from torch.utils.data import Dataset
 
 from rsl_rl.motion.smp_corpus import SMPMotionCorpus
 
+LEGACY_SMP_FEATURE_SCHEMA = "legacy_192"
+EXTENDED_SMP_FEATURE_SCHEMA = "extended_198"
+
 
 @dataclass(frozen=True)
 class _SMPClipRecord:
@@ -47,11 +50,13 @@ class SMPMotionWindowDataset(Dataset):
         self.window_records: list[_SMPWindowRecord] = []
         self.style_names: list[str] = []
         self.style_to_id: dict[str, int] = {}
+        self.feature_schema = LEGACY_SMP_FEATURE_SCHEMA
 
         if dataset_path.suffix.lower() == ".json":
             self._load_from_manifest(dataset_path)
         else:
             frames, metadata = self._load_npz_frames(dataset_path)
+            self.feature_schema = str(metadata["feature_schema"])
             self.style_names = [metadata["style_name"]] if metadata["style_name"] is not None else []
             self.style_to_id = (
                 {metadata["style_name"]: metadata["style_id"]}
@@ -72,6 +77,12 @@ class SMPMotionWindowDataset(Dataset):
         self.style_to_id = dict(corpus.style_to_id)
         for clip_id, entry in enumerate(corpus.entries):
             frames, metadata = self._load_npz_frames(entry.path)
+            if clip_id == 0:
+                self.feature_schema = str(metadata["feature_schema"])
+            elif str(metadata["feature_schema"]) != self.feature_schema:
+                raise ValueError(
+                    f"All manifest datasets must share one feature_schema, got {self.feature_schema} and {metadata['feature_schema']}"
+                )
             self._append_clip(
                 frames=frames,
                 style_id=entry.style_id,
@@ -96,7 +107,13 @@ class SMPMotionWindowDataset(Dataset):
             if "frames" not in data:
                 raise KeyError("SMP dataset npz must contain 'frames'")
             frames = data["frames"]
+            feature_schema = self._read_optional_scalar(data, "feature_schema")
+            normalized_feature_schema = self._normalize_feature_schema(
+                feature_schema,
+                feature_dim=int(frames.shape[1]) if frames.ndim == 2 else None,
+            )
             metadata = {
+                "feature_schema": normalized_feature_schema,
                 "style_id": self._read_optional_scalar(data, "style_id"),
                 "style_name": self._read_optional_scalar(data, "style_name"),
                 "source_name": self._read_optional_scalar(data, "source_name"),
@@ -108,6 +125,17 @@ class SMPMotionWindowDataset(Dataset):
             raise ValueError(f"Expected at least {self.window_size} frames, got {frames.shape[0]}")
 
         return torch.as_tensor(frames, dtype=torch.float32), metadata
+
+    @staticmethod
+    def _normalize_feature_schema(feature_schema: object | None, feature_dim: int | None) -> str:
+        if feature_schema is not None:
+            normalized = str(feature_schema)
+            if normalized not in {LEGACY_SMP_FEATURE_SCHEMA, EXTENDED_SMP_FEATURE_SCHEMA}:
+                raise ValueError(f"Unsupported SMP feature_schema {normalized!r}")
+            return normalized
+        if feature_dim == 198:
+            return EXTENDED_SMP_FEATURE_SCHEMA
+        return LEGACY_SMP_FEATURE_SCHEMA
 
     def _append_clip(
         self,
