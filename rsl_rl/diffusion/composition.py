@@ -100,6 +100,10 @@ def build_g1_body_part_feature_masks(
     base_ang_start, base_ang_stop = _ensure_feature_block(feature_block_offsets, "base_ang_vel_b")
     masks["shared_body"][base_lin_start:base_lin_stop] = 1.0
     masks["shared_body"][base_ang_start:base_ang_stop] = 1.0
+    for optional_shared_block in ("base_lin_vel_w", "base_ang_vel_w"):
+        if optional_shared_block in feature_block_offsets:
+            start, stop = _ensure_feature_block(feature_block_offsets, optional_shared_block)
+            masks["shared_body"][start:stop] = 1.0
 
     _, (joint_start, joint_stop) = _find_joint_feature_block(feature_block_offsets)
     joint_block_size = joint_stop - joint_start

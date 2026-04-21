@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import statistics
 import time
@@ -55,12 +56,18 @@ class SMPOnPolicyRunner(OnPolicyRunner):
 
         # 这里的 scheduler 和 reward 仅负责对扩散 prior 的噪声预测质量做度量，不参与参数更新。
         self.smp_scheduler = DiffusionScheduler(num_steps=int(self.smp_prior_cfg["num_diffusion_steps"]))
+        fixed_normalizer_mse_by_timestep = None
+        if str(_cfg_get(self.smp_prior_cfg, "reward_mode", "absolute")) == "fixed_normalizer":
+            fixed_normalizer_mse_by_timestep = self._resolve_fixed_normalizer_mse_by_timestep()
         self.smp_reward = SMPReward(
             num_diffusion_steps=int(self.smp_prior_cfg["num_diffusion_steps"]),
             timesteps_k=list(self.smp_prior_cfg["timesteps_k"]),
             reward_scale=float(self.smp_prior_cfg["reward_scale"]),
             reward_mode=str(_cfg_get(self.smp_prior_cfg, "reward_mode", "absolute")),
-            adaptive_norm_decay=float(self.smp_prior_cfg.get("adaptive_norm_decay", 0.99)),
+            adaptive_norm_decay=float(self.smp_prior_cfg.get("adaptive_norm_decay", 0.999)),
+            zscore_reward_center=float(_cfg_get(self.smp_prior_cfg, "zscore_reward_center", 0.8)),
+            zscore_std_floor=float(_cfg_get(self.smp_prior_cfg, "zscore_std_floor", 1.0e-6)),
+            fixed_normalizer_mse_by_timestep=fixed_normalizer_mse_by_timestep,
         )
         self.smp_prior = self._load_prior_model()
         self.style_program = self._resolve_style_program_from_cfg()
@@ -68,6 +75,37 @@ class SMPOnPolicyRunner(OnPolicyRunner):
             raise ValueError("reward_mode='target_vs_uncond' requires a conditional SMP style program")
         self.gsi_sampler = self._build_gsi_sampler()
         self.git_status_repos.append(rsl_rl.__file__)
+
+    def _resolve_fixed_normalizer_mse_by_timestep(self) -> dict[int, float]:
+        """解析 fixed_normalizer 模式使用的每个时间步参考 MSE。"""
+        timesteps_k = [int(timestep) for timestep in _cfg_get(self.smp_prior_cfg, "timesteps_k", [])]
+        inline_stats = dict(_cfg_get(self.smp_prior_cfg, "fixed_normalizer_mse_by_timestep", {}))
+        if inline_stats:
+            resolved = {int(timestep): float(value) for timestep, value in inline_stats.items()}
+        else:
+            stats_path = _cfg_get(self.smp_prior_cfg, "fixed_normalizer_stats_path", None)
+            if stats_path is None:
+                raise ValueError(
+                    "reward_mode='fixed_normalizer' requires fixed_normalizer_mse_by_timestep "
+                    "or fixed_normalizer_stats_path"
+                )
+            with open(stats_path, encoding="utf-8") as file:
+                payload = json.load(file)
+            if "fixed_normalizer_mse_by_timestep" in payload:
+                source = payload["fixed_normalizer_mse_by_timestep"]
+            elif "per_timestep_raw_mse_mean" in payload:
+                source = payload["per_timestep_raw_mse_mean"]
+            else:
+                source = payload["groups"]["positive"]["per_timestep_raw_mse_mean"]
+            resolved = {int(timestep): float(value) for timestep, value in dict(source).items()}
+
+        missing_timesteps = [int(timestep) for timestep in timesteps_k if int(timestep) not in resolved]
+        if missing_timesteps:
+            raise ValueError(
+                "fixed normalizer stats are missing timesteps "
+                f"{missing_timesteps} required by timesteps_k={timesteps_k}"
+            )
+        return {int(timestep): float(resolved[int(timestep)]) for timestep in timesteps_k}
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
         """执行 on-policy 训练主循环，在 rollout 中引入 SMP 指标与 GSI reset 机制。"""
@@ -394,6 +432,9 @@ class SMPOnPolicyRunner(OnPolicyRunner):
         feature_dim = int(model_cfg.get("feature_dim", self.smp_prior_cfg["feature_dim"]))
         window_size = int(model_cfg.get("window_size", self.smp_prior_cfg["window_size"]))
         num_diffusion_steps = int(model_cfg.get("num_diffusion_steps", self.smp_prior_cfg["num_diffusion_steps"]))
+        self.smp_prior_feature_dim = feature_dim
+        self.smp_prior_window_size = window_size
+        self.smp_prior_feature_schema = str(model_cfg.get("feature_schema", _cfg_get(self.smp_prior_cfg, "feature_schema", "legacy_192")))
         num_styles = int(model_cfg.get("num_styles", 0))
         hidden_dim = int(model_cfg.get("hidden_dim", checkpoint["model_state_dict"]["token_proj.weight"].shape[0]))
         num_layers = int(model_cfg.get("num_layers", 2))
@@ -512,8 +553,8 @@ class SMPOnPolicyRunner(OnPolicyRunner):
         sampler = SMPDiffusionSampler(
             model=self.smp_prior,
             num_diffusion_steps=int(self.smp_prior_cfg["num_diffusion_steps"]),
-            feature_dim=int(self.smp_prior_cfg["feature_dim"]),
-            window_size=int(self.smp_prior_cfg["window_size"]),
+            feature_dim=int(getattr(self, "smp_prior_feature_dim", self.smp_prior_cfg["feature_dim"])),
+            window_size=int(getattr(self, "smp_prior_window_size", self.smp_prior_cfg["window_size"])),
             device=self.device,
         )
         decoder = SMPGSIDecoder(
@@ -746,8 +787,8 @@ class SMPOnPolicyRunner(OnPolicyRunner):
         if self.smp_obs_group not in obs:
             raise KeyError(f"SMP observation group '{self.smp_obs_group}' not found in observations")
         smp_window = obs[self.smp_obs_group]
-        feature_dim = int(self.smp_prior_cfg["feature_dim"])
-        window_size = int(self.smp_prior_cfg["window_size"])
+        feature_dim = int(getattr(self, "smp_prior_feature_dim", self.smp_prior_cfg["feature_dim"]))
+        window_size = int(getattr(self, "smp_prior_window_size", self.smp_prior_cfg["window_size"]))
         if smp_window.shape[-1] != window_size * feature_dim:
             raise ValueError(
                 f"Expected flattened SMP dim {window_size * feature_dim}, got {smp_window.shape[-1]}"
