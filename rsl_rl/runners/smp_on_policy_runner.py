@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 import statistics
 import time
 from collections import deque
@@ -52,6 +54,7 @@ class SMPOnPolicyRunner(OnPolicyRunner):
         # style_cfg 决定 prior 是无条件、单风格还是 body mask 组合风格；gsi_cfg 决定是否对 reset 做重采样。
         self.style_cfg = _cfg_get(self.smp_prior_cfg, "style_cfg", None)
         self.gsi_cfg = _cfg_get(train_cfg, "gsi_cfg", None)
+        self.fixed_norm_mse = self._load_fixed_norm_mse()
 
         # 这里的 scheduler 和 reward 仅负责对扩散 prior 的噪声预测质量做度量，不参与参数更新。
         self.smp_scheduler = DiffusionScheduler(num_steps=int(self.smp_prior_cfg["num_diffusion_steps"]))
@@ -60,7 +63,8 @@ class SMPOnPolicyRunner(OnPolicyRunner):
             timesteps_k=list(self.smp_prior_cfg["timesteps_k"]),
             reward_scale=float(self.smp_prior_cfg["reward_scale"]),
             reward_mode=str(_cfg_get(self.smp_prior_cfg, "reward_mode", "absolute")),
-            adaptive_norm_decay=float(self.smp_prior_cfg.get("adaptive_norm_decay", 0.99)),
+            adaptive_norm_decay=float(_cfg_get(self.smp_prior_cfg, "adaptive_norm_decay", 0.99)),
+            fixed_norm_mse=self.fixed_norm_mse,
         )
         self.smp_prior = self._load_prior_model()
         self.style_program = self._resolve_style_program_from_cfg()
@@ -68,6 +72,51 @@ class SMPOnPolicyRunner(OnPolicyRunner):
             raise ValueError("reward_mode='target_vs_uncond' requires a conditional SMP style program")
         self.gsi_sampler = self._build_gsi_sampler()
         self.git_status_repos.append(rsl_rl.__file__)
+
+    def _load_fixed_norm_mse(self) -> dict[int, float] | None:
+        """从 JSON 载入固定归一化 anchor；未配置时返回 None。"""
+        anchor_path = _cfg_get(self.smp_prior_cfg, "norm_anchor_path", None)
+        if anchor_path is None or str(anchor_path).strip() == "":
+            return None
+
+        resolved_path = Path(anchor_path).expanduser().resolve()
+        if not resolved_path.exists():
+            raise FileNotFoundError(f"SMP norm anchor file not found: {resolved_path}")
+        if resolved_path.suffix.lower() != ".json":
+            raise ValueError(f"SMP norm anchor must be a JSON file, got: {resolved_path}")
+
+        payload = json.loads(resolved_path.read_text(encoding="utf-8"))
+        mu_ref_payload = payload.get("mu_ref")
+        if not isinstance(mu_ref_payload, dict) or len(mu_ref_payload) == 0:
+            raise ValueError(f"SMP norm anchor JSON must contain a non-empty mu_ref dict: {resolved_path}")
+
+        expected_timesteps = [int(timestep) for timestep in _cfg_get(self.smp_prior_cfg, "timesteps_k", [])]
+        anchors = {int(timestep): float(value) for timestep, value in mu_ref_payload.items()}
+        missing_timesteps = [timestep for timestep in expected_timesteps if timestep not in anchors]
+        if missing_timesteps:
+            raise ValueError(
+                f"SMP norm anchor {resolved_path} is missing timesteps required by runner config: {missing_timesteps}"
+            )
+
+        checkpoint_path = _cfg_get(self.smp_prior_cfg, "checkpoint_path", None)
+        recorded_checkpoint = payload.get("checkpoint_path")
+        if checkpoint_path is not None and recorded_checkpoint is not None:
+            if Path(str(recorded_checkpoint)).expanduser().resolve() != Path(str(checkpoint_path)).expanduser().resolve():
+                raise ValueError(
+                    "SMP norm anchor checkpoint_path does not match runner checkpoint_path: "
+                    f"{recorded_checkpoint} != {checkpoint_path}"
+                )
+
+        recorded_timesteps = payload.get("timesteps_k")
+        if recorded_timesteps is not None:
+            normalized_recorded_timesteps = [int(timestep) for timestep in recorded_timesteps]
+            if normalized_recorded_timesteps != expected_timesteps:
+                raise ValueError(
+                    "SMP norm anchor timesteps_k does not match runner timesteps_k: "
+                    f"{normalized_recorded_timesteps} != {expected_timesteps}"
+                )
+
+        return {int(timestep): float(anchors[int(timestep)]) for timestep in expected_timesteps}
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
         """执行 on-policy 训练主循环，在 rollout 中引入 SMP 指标与 GSI reset 机制。"""
@@ -793,7 +842,7 @@ class SMPOnPolicyRunner(OnPolicyRunner):
             smp_rewards = smp_rewards.unsqueeze(-1)
         dt = self.env.unwrapped.step_dt
         task_scaled = self.task_reward_coef * task_rewards
-        smp_scaled = self.smp_reward_coef * smp_rewards * dt
+        smp_scaled = self.smp_reward_coef * smp_rewards*dt
         return {
             "task_raw": task_rewards,
             "task_scaled": task_scaled,

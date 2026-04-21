@@ -30,6 +30,7 @@ class SMPReward:
         reward_scale: float,
         reward_mode: str = "absolute",
         adaptive_norm_decay: float = 0.99,
+        fixed_norm_mse: dict[int, float] | None = None,
     ):
         # 参数提前校验，尽量把错误暴露在初始化阶段。
         if num_diffusion_steps <= 0:
@@ -40,6 +41,22 @@ class SMPReward:
             raise ValueError(f"reward_mode must be 'absolute' or 'target_vs_uncond', got {reward_mode}")
         if not 0.0 < adaptive_norm_decay <= 1.0:
             raise ValueError(f"adaptive_norm_decay must lie in (0, 1], got {adaptive_norm_decay}")
+        if fixed_norm_mse is not None and reward_mode != "absolute":
+            raise ValueError("fixed_norm_mse is only supported when reward_mode='absolute'")
+
+        normalized_fixed_mse = None
+        if fixed_norm_mse is not None:
+            normalized_fixed_mse = {int(timestep): float(value) for timestep, value in fixed_norm_mse.items()}
+            missing_timesteps = [timestep for timestep in timesteps_k if int(timestep) not in normalized_fixed_mse]
+            if missing_timesteps:
+                raise ValueError(f"Missing fixed_norm_mse anchors for timesteps: {missing_timesteps}")
+            invalid_timesteps = [
+                int(timestep)
+                for timestep, value in normalized_fixed_mse.items()
+                if float(value) <= 0.0
+            ]
+            if invalid_timesteps:
+                raise ValueError(f"fixed_norm_mse must be positive for all timesteps, got {invalid_timesteps}")
 
         # 全局配置。
         self.num_diffusion_steps = num_diffusion_steps
@@ -47,10 +64,14 @@ class SMPReward:
         self.reward_scale = reward_scale
         self.reward_mode = reward_mode
         self.adaptive_norm_decay = adaptive_norm_decay
+        self.fixed_norm_mse = normalized_fixed_mse
 
         # 为每个时间步维护一个 EMA 均值，用作该时间步的误差“尺度”。
         # running_mse[t] 是单个标量，不是每个样本各存一份。
-        self.running_mse = {timestep: None for timestep in self.timesteps_k}
+        self.running_mse = {
+            timestep: (torch.tensor(float(self.fixed_norm_mse[timestep]), dtype=torch.float32) if self.fixed_norm_mse is not None else None)
+            for timestep in self.timesteps_k
+        }
 
     def _normalize(self, timestep: int, mse: torch.Tensor) -> torch.Tensor:
         """把某个时间步的逐样本 MSE 转成可跨时间步比较的量。
@@ -62,6 +83,11 @@ class SMPReward:
         返回:
         - 归一化后的逐样本误差，shape 为 (B,)
         """
+        if self.fixed_norm_mse is not None:
+            anchor_value = float(self.fixed_norm_mse[timestep])
+            self.running_mse[timestep] = torch.tensor(anchor_value, dtype=torch.float32)
+            return mse / mse.new_tensor(anchor_value).clamp_min(1.0e-6)
+
         # 用 EMA 估计“这个时间步通常有多大误差”。
         mse_mean = mse.detach().mean()
         running_mse = self.running_mse[timestep]
