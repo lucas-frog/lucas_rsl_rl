@@ -16,6 +16,24 @@ from rsl_rl.diffusion.model import MotionEpsilonTransformer
 from rsl_rl.diffusion.scheduler import DiffusionScheduler
 from rsl_rl.motion import SMPMotionWindowDataset
 
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    class _TqdmFallback:
+        def __init__(self, iterable, **kwargs):
+            self._iterable = iterable
+
+        def __iter__(self):
+            return iter(self._iterable)
+
+        def set_postfix(self, ordered_dict=None, refresh=True, **kwargs):
+            return None
+
+        def close(self):
+            return None
+
+    tqdm = _TqdmFallback
+
 
 def _collate_smp_samples(samples: list[dict[str, object]]) -> dict[str, object]:
     """将带元数据的 sample 聚合成 batch。"""
@@ -230,6 +248,8 @@ class SMPDiffusionTrainer:
             f"{'Feature schema:':>{pad}} {self.feature_schema or 'n/a'}\n"
             f"{'Pretrain timesteps:':>{pad}} uniform[0, {self.scheduler.num_steps - 1}]\n"
             f"{'Reward timesteps k:':>{pad}} {self.timesteps_k}\n"
+            f"{'Histogram logging:':>{pad}} "
+            f"{'disabled' if self.log_histograms_every == 0 else f'every {self.log_histograms_every} steps'}\n"
             f"{'Steps per epoch:':>{pad}} {self._steps_per_epoch}\n"
             f"{'=' * width}\n"
         )
@@ -323,7 +343,14 @@ class SMPDiffusionTrainer:
         final_loss = None
         mean_loss = 0.0
         start_time = time.perf_counter()
-        for global_step in range(1, self.max_iters + 1):
+        progress_bar = tqdm(
+            range(1, self.max_iters + 1),
+            total=self.max_iters,
+            desc="SMP pretrain",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        for global_step in progress_bar:
             iteration_start_time = time.perf_counter()
             batch = self._next_batch()
             loss, per_timestep_mse, eps, eps_hat, loss_cond, loss_uncond, per_style_mse = self._compute_loss(batch)
@@ -335,6 +362,11 @@ class SMPDiffusionTrainer:
 
             final_loss = float(loss.detach().cpu().item())
             mean_loss += (final_loss - mean_loss) / global_step
+            progress_bar.set_postfix(
+                loss=f"{final_loss:.4f}",
+                running_loss=f"{mean_loss:.4f}",
+                refresh=False,
+            )
 
             log_smp_pretrain_metrics(
                 self.writer,
@@ -360,6 +392,7 @@ class SMPDiffusionTrainer:
                     start_time=start_time,
                     iteration_time=time.perf_counter() - iteration_start_time,
                 )
+        progress_bar.close()
 
         checkpoint_path = self.save_checkpoint()
         self.writer.flush()

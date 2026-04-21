@@ -11,15 +11,7 @@ class SMPReward:
        - 在多个固定时间步上算预测噪声和真实噪声的 MSE。
        - 每个时间步单独做运行均值（EMA）归一化。
        - 再把时间步误差求平均，映射成奖励: r = exp(-scale * mse)。
-    2. fixed_normalizer:
-       - 使用离线估计好的每个时间步参考 MSE 作为固定归一化尺度。
-       - 在线 PPO 阶段不更新这些尺度，避免 reward drift。
-       - 再把时间步误差求平均，映射成奖励: r = exp(-scale * mse)。
-    3. zscore:
-       - 为每个时间步维护 MSE 的运行均值和方差。
-       - 用 z-score 保留 batch 内动作好坏的相对差异。
-       - 再用 sigmoid 把奖励限制在 [0, 1]，历史均值附近约为 0.8。
-    4. target_vs_uncond:
+    2. target_vs_uncond:
        - 分别计算 target 条件预测与 unconditional 预测的逐样本噪声误差。
        - 不做归一化，先各自映射成 reward_target / reward_uncond。
        - 再把“相对 unconditional 的提升比例”映射到 [0, 1]:
@@ -37,38 +29,34 @@ class SMPReward:
         timesteps_k: list[int] | tuple[int, ...],
         reward_scale: float,
         reward_mode: str = "absolute",
-        adaptive_norm_decay: float = 0.999,
-        zscore_reward_center: float = 0.8,
-        zscore_std_floor: float = 1.0e-6,
-        fixed_normalizer_mse_by_timestep: dict[int, float] | None = None,
+        adaptive_norm_decay: float = 0.99,
+        fixed_norm_mse: dict[int, float] | None = None,
     ):
         # 参数提前校验，尽量把错误暴露在初始化阶段。
         if num_diffusion_steps <= 0:
             raise ValueError(f"num_diffusion_steps must be positive, got {num_diffusion_steps}")
         if len(timesteps_k) == 0:
             raise ValueError("timesteps_k must be non-empty")
-        if reward_mode not in {"absolute", "fixed_normalizer", "zscore", "target_vs_uncond"}:
-            raise ValueError(
-                "reward_mode must be 'absolute', 'fixed_normalizer', 'zscore', or 'target_vs_uncond', "
-                f"got {reward_mode}"
-            )
+        if reward_mode not in {"absolute", "target_vs_uncond"}:
+            raise ValueError(f"reward_mode must be 'absolute' or 'target_vs_uncond', got {reward_mode}")
         if not 0.0 < adaptive_norm_decay <= 1.0:
             raise ValueError(f"adaptive_norm_decay must lie in (0, 1], got {adaptive_norm_decay}")
-        if not 0.0 < zscore_reward_center < 1.0:
-            raise ValueError(f"zscore_reward_center must lie in (0, 1), got {zscore_reward_center}")
-        if zscore_std_floor <= 0.0:
-            raise ValueError(f"zscore_std_floor must be positive, got {zscore_std_floor}")
-        if reward_mode == "fixed_normalizer":
-            if not fixed_normalizer_mse_by_timestep:
-                raise ValueError("reward_mode='fixed_normalizer' requires fixed_normalizer_mse_by_timestep")
-            missing_timesteps = [
-                int(timestep) for timestep in timesteps_k if int(timestep) not in fixed_normalizer_mse_by_timestep
-            ]
+        if fixed_norm_mse is not None and reward_mode != "absolute":
+            raise ValueError("fixed_norm_mse is only supported when reward_mode='absolute'")
+
+        normalized_fixed_mse = None
+        if fixed_norm_mse is not None:
+            normalized_fixed_mse = {int(timestep): float(value) for timestep, value in fixed_norm_mse.items()}
+            missing_timesteps = [timestep for timestep in timesteps_k if int(timestep) not in normalized_fixed_mse]
             if missing_timesteps:
-                raise ValueError(
-                    "fixed_normalizer_mse_by_timestep is missing timesteps "
-                    f"{missing_timesteps} required by timesteps_k={list(timesteps_k)}"
-                )
+                raise ValueError(f"Missing fixed_norm_mse anchors for timesteps: {missing_timesteps}")
+            invalid_timesteps = [
+                int(timestep)
+                for timestep, value in normalized_fixed_mse.items()
+                if float(value) <= 0.0
+            ]
+            if invalid_timesteps:
+                raise ValueError(f"fixed_norm_mse must be positive for all timesteps, got {invalid_timesteps}")
 
         # 全局配置。
         self.num_diffusion_steps = num_diffusion_steps
@@ -76,48 +64,14 @@ class SMPReward:
         self.reward_scale = reward_scale
         self.reward_mode = reward_mode
         self.adaptive_norm_decay = adaptive_norm_decay
-        self.zscore_reward_center = zscore_reward_center
-        self.zscore_std_floor = zscore_std_floor
-        self.zscore_reward_bias = torch.logit(torch.tensor(float(zscore_reward_center)))
-        self.fixed_normalizer_mse_by_timestep = (
-            None
-            if fixed_normalizer_mse_by_timestep is None
-            else {int(timestep): float(value) for timestep, value in fixed_normalizer_mse_by_timestep.items()}
-        )
+        self.fixed_norm_mse = normalized_fixed_mse
 
         # 为每个时间步维护一个 EMA 均值，用作该时间步的误差“尺度”。
         # running_mse[t] 是单个标量，不是每个样本各存一份。
-        self.running_mse = {timestep: None for timestep in self.timesteps_k}
-        self.running_mse_var = {timestep: None for timestep in self.timesteps_k}
-
-    def _update_running_mean(self, timestep: int, mse: torch.Tensor) -> torch.Tensor:
-        """更新并返回某个时间步的 MSE 运行均值。"""
-        mse_mean = mse.detach().mean()
-        running_mse = self.running_mse[timestep]
-        if running_mse is None:
-            running_mse = mse_mean
-        else:
-            running_mse = running_mse * self.adaptive_norm_decay + mse_mean * (1.0 - self.adaptive_norm_decay)
-        self.running_mse[timestep] = running_mse
-        return running_mse
-
-    def _update_running_stats(self, timestep: int, mse: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """更新并返回某个时间步的 MSE 运行均值和标准差。"""
-        mse_detached = mse.detach()
-        mse_mean = mse_detached.mean()
-        mse_var = mse_detached.var(unbiased=False)
-        running_mse = self.running_mse[timestep]
-        running_mse_var = self.running_mse_var[timestep]
-        if running_mse is None or running_mse_var is None:
-            running_mse = mse_mean
-            running_mse_var = mse_var
-        else:
-            running_mse = running_mse * self.adaptive_norm_decay + mse_mean * (1.0 - self.adaptive_norm_decay)
-            running_mse_var = running_mse_var * self.adaptive_norm_decay + mse_var * (1.0 - self.adaptive_norm_decay)
-        self.running_mse[timestep] = running_mse
-        self.running_mse_var[timestep] = running_mse_var
-        running_mse_std = running_mse_var.clamp_min(self.zscore_std_floor * self.zscore_std_floor).sqrt()
-        return running_mse, running_mse_std
+        self.running_mse = {
+            timestep: (torch.tensor(float(self.fixed_norm_mse[timestep]), dtype=torch.float32) if self.fixed_norm_mse is not None else None)
+            for timestep in self.timesteps_k
+        }
 
     def _normalize(self, timestep: int, mse: torch.Tensor) -> torch.Tensor:
         """把某个时间步的逐样本 MSE 转成可跨时间步比较的量。
@@ -129,13 +83,21 @@ class SMPReward:
         返回:
         - 归一化后的逐样本误差，shape 为 (B,)
         """
-        # 按论文式 absolute reward 的语义，当前 batch 先用旧的运行均值做评分，
-        # 再把当前 batch 的统计量写回 EMA，避免“当前 batch 参与定义自己的基准”。
+        if self.fixed_norm_mse is not None:
+            anchor_value = float(self.fixed_norm_mse[timestep])
+            self.running_mse[timestep] = torch.tensor(anchor_value, dtype=torch.float32)
+            return mse / mse.new_tensor(anchor_value).clamp_min(1.0e-6)
+
+        # 用 EMA 估计“这个时间步通常有多大误差”。
+        mse_mean = mse.detach().mean()
         running_mse = self.running_mse[timestep]
         if running_mse is None:
-            running_mse = mse.detach().mean()
-
-        self._update_running_mean(timestep, mse)
+            # 首次出现该时间步时，直接用当前 batch 均值初始化。
+            running_mse = mse_mean
+        else:
+            # EMA 更新公式: s <- decay * s + (1 - decay) * new_mean
+            running_mse = running_mse * self.adaptive_norm_decay + mse_mean * (1.0 - self.adaptive_norm_decay)
+        self.running_mse[timestep] = running_mse
 
         # clamp_min 防止分母太小，导致归一化值异常放大。
         return mse / running_mse.clamp_min(1.0e-6)
@@ -159,8 +121,6 @@ class SMPReward:
         """
         per_timestep_mse = {}
         normalized_terms = []
-        fixed_normalized_terms = []
-        zscore_terms = []
         per_timestep_mse_uncond = {}
 
         # 对每个预设时间步分别计算误差并归一化。
@@ -179,17 +139,6 @@ class SMPReward:
             per_timestep_mse[timestep] = mse
             if self.reward_mode == "absolute":
                 normalized_terms.append(self._normalize(timestep, mse))
-            if self.reward_mode == "fixed_normalizer":
-                assert self.fixed_normalizer_mse_by_timestep is not None
-                fixed_scale = torch.as_tensor(
-                    self.fixed_normalizer_mse_by_timestep[int(timestep)],
-                    device=mse.device,
-                    dtype=mse.dtype,
-                )
-                fixed_normalized_terms.append(mse / fixed_scale.clamp_min(1.0e-6))
-            if self.reward_mode == "zscore":
-                running_mse, running_mse_std = self._update_running_stats(timestep, mse)
-                zscore_terms.append((mse - running_mse) / running_mse_std)
 
             if self.reward_mode == "target_vs_uncond":
                 if eps_hat_uncond is None or timestep not in eps_hat_uncond:
@@ -209,27 +158,6 @@ class SMPReward:
             reward = torch.exp(-self.reward_scale * noise_mse)
             return {
                 "reward": reward,
-                "noise_mse": noise_mse,
-                "per_timestep_mse": per_timestep_mse,
-            }
-
-        if self.reward_mode == "fixed_normalizer":
-            noise_mse = torch.stack(fixed_normalized_terms, dim=0).mean(dim=0)
-            reward = torch.exp(-self.reward_scale * noise_mse)
-            return {
-                "reward": reward,
-                "noise_mse": noise_mse,
-                "per_timestep_mse": per_timestep_mse,
-            }
-
-        if self.reward_mode == "zscore":
-            noise_mse = torch.stack([per_timestep_mse[timestep] for timestep in self.timesteps_k], dim=0).mean(dim=0)
-            noise_z = torch.stack(zscore_terms, dim=0).mean(dim=0)
-            reward_bias = self.zscore_reward_bias.to(device=noise_z.device, dtype=noise_z.dtype)
-            reward = torch.sigmoid(reward_bias - self.reward_scale * noise_z)
-            return {
-                "reward": reward,
-                "noise_z": noise_z,
                 "noise_mse": noise_mse,
                 "per_timestep_mse": per_timestep_mse,
             }
