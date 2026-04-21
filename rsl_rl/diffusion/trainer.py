@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import time
+import warnings
 from pathlib import Path
 
 import torch
@@ -51,6 +52,7 @@ class SMPDiffusionTrainer:
         beta_end: float = 2.0e-2,
         num_styles: int | None = None,
         style_drop_prob: float = 0.0,
+        log_histograms: bool = False,
         device: str | torch.device | None = None,
     ):
         self.dataset_path = Path(dataset_path)
@@ -68,13 +70,21 @@ class SMPDiffusionTrainer:
         if any(timestep < 0 or timestep >= num_diffusion_steps for timestep in self.timesteps_k):
             raise ValueError(f"timesteps_k must stay within [0, {num_diffusion_steps - 1}]")
         self.style_drop_prob = style_drop_prob
+        self.log_histograms = bool(log_histograms)
 
         self.dataset = SMPMotionWindowDataset(self.dataset_path, window_size=window_size, stride=stride)
+        self.feature_schema = getattr(self.dataset, "feature_schema", None)
         inferred_num_styles = len(self.dataset.style_to_id)
         self.num_styles = inferred_num_styles if num_styles is None else num_styles
         if self.num_styles < inferred_num_styles:
             raise ValueError(
                 f"num_styles={self.num_styles} is smaller than dataset styles={inferred_num_styles}"
+            )
+        if inferred_num_styles > 0 and self.style_drop_prob == 0.0:
+            warnings.warn(
+                "Dataset contains style labels but style_drop_prob=0.0; null-style / uncond CFG training is disabled.",
+                UserWarning,
+                stacklevel=2,
             )
 
         self.dataloader = DataLoader(
@@ -217,6 +227,7 @@ class SMPDiffusionTrainer:
             f"{'Device:':>{pad}} {self.device}\n"
             f"{'Max iterations:':>{pad}} {self.max_iters}\n"
             f"{'Diffusion steps:':>{pad}} {self.scheduler.num_steps}\n"
+            f"{'Feature schema:':>{pad}} {self.feature_schema or 'n/a'}\n"
             f"{'Pretrain timesteps:':>{pad}} uniform[0, {self.scheduler.num_steps - 1}]\n"
             f"{'Reward timesteps k:':>{pad}} {self.timesteps_k}\n"
             f"{'Steps per epoch:':>{pad}} {self._steps_per_epoch}\n"
@@ -294,6 +305,7 @@ class SMPDiffusionTrainer:
                 "hidden_dim": self.model.hidden_dim,
                 "num_layers": len(self.model.encoder.layers),
                 "num_heads": self.model.encoder.layers[0].self_attn.num_heads,
+                "feature_schema": self.feature_schema,
             },
             "style_cfg": {
                 "style_names": list(self.dataset.style_names),
@@ -334,6 +346,7 @@ class SMPDiffusionTrainer:
                 loss_cond=loss_cond,
                 loss_uncond=loss_uncond,
                 per_style_mse=per_style_mse,
+                log_histograms=self.log_histograms,
             )
 
             if self._should_log_step(global_step):

@@ -21,11 +21,15 @@ def log_smp_noise_metrics(
     eps,
     eps_hat,
     prefix: str = "SMP",
+    log_histograms: bool = True,
 ):
     """记录噪声误差标量与直方图。"""
     writer.add_scalar(f"{prefix}/noise_mse", _to_scalar(noise_mse), global_step)
     for timestep, mse in sorted(per_timestep_mse.items()):
         writer.add_scalar(f"{prefix}/t{timestep}/noise_mse", _to_scalar(mse), global_step)
+
+    if not log_histograms:
+        return
 
     if isinstance(eps, dict):
         if not isinstance(eps_hat, dict):
@@ -55,6 +59,7 @@ def log_smp_pretrain_metrics(
     loss_cond: float | torch.Tensor | None = None,
     loss_uncond: float | torch.Tensor | None = None,
     per_style_mse: dict[str, float | torch.Tensor] | None = None,
+    log_histograms: bool = False,
 ):
     """记录离线预训练阶段的噪声误差指标。"""
     writer.add_scalar("SMPPretrain/loss", _to_scalar(loss), global_step)
@@ -74,4 +79,5 @@ def log_smp_pretrain_metrics(
         eps=eps,
         eps_hat=eps_hat,
         prefix="SMPPretrain",
+        log_histograms=log_histograms,
     )
